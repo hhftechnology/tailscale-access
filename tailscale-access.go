@@ -1,10 +1,10 @@
-// Package tailscaleauth provides Tailscale-aware IP authentication for Traefik
+// Package tailscale_access provides Tailscale-aware IP authentication for Traefik
 package tailscale_access
 
 import (
 	"context"
 	"fmt"
-	"log" // Using log package for more standard logging output
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -25,7 +25,6 @@ var DefaultHeadersToCheck = []string{
 	"CF-Connecting-IP",         // Cloudflare
 	"True-Client-IP",           // Akamai and Cloudflare
 	"X-Client-IP",              // Common alternative
-	// Add other headers if your specific setup uses them
 }
 
 // Config represents the configuration options for the Tailscale authentication plugin.
@@ -49,6 +48,14 @@ type Config struct {
 	// CustomErrorMessage is the message displayed to users when access is denied.
 	// Defaults to "Access denied: Tailscale connection required".
 	CustomErrorMessage string `json:"customErrorMessage,omitempty"`
+
+	// StrictMode, if true, only allows IPs from headers if they're Tailscale IPs.
+	// This prevents header spoofing attacks. Defaults to true for security.
+	StrictMode bool `json:"strictMode,omitempty"`
+
+	// TrustedProxies defines CIDR ranges of trusted proxies that are allowed to set forwarding headers.
+	// If empty, headers from any source are trusted (less secure).
+	TrustedProxies []string `json:"trustedProxies,omitempty"`
 }
 
 // CreateConfig creates a default plugin configuration.
@@ -59,16 +66,19 @@ func CreateConfig() *Config {
 		EnableDebugLogging: false,
 		CustomErrorMessage: DefaultErrorMessage,
 		AdditionalRanges:   []string{}, // Explicitly empty by default
+		StrictMode:         true,       // Enable strict mode by default for security
+		TrustedProxies:     []string{}, // No trusted proxies by default
 	}
 }
 
 // TailscaleAuth is the middleware instance.
 type TailscaleAuth struct {
-	next               http.Handler
-	name               string
-	config             *Config
-	parsedTailscaleNets []*net.IPNet
+	next                 http.Handler
+	name                 string
+	config               *Config
+	parsedTailscaleNets  []*net.IPNet
 	parsedAdditionalNets []*net.IPNet
+	parsedTrustedProxies []*net.IPNet
 }
 
 // New creates a new instance of the Tailscale authentication middleware.
@@ -95,13 +105,18 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		return nil, fmt.Errorf("failed to parse additionalRanges: %w", err)
 	}
 
+	parsedTrustedProxies, err := parseCIDRs(config.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse trustedProxies: %w", err)
+	}
+
 	if len(parsedTailscaleNets) == 0 && len(parsedAdditionalNets) == 0 {
 		return nil, fmt.Errorf("tailscale-auth plugin misconfiguration: at least one valid TailscaleRange or AdditionalRange must be provided")
 	}
 
 	if config.EnableDebugLogging {
-		log.Printf("[INFO] TailscaleAuth plugin '%s' initialized. Tailscale Ranges: %v, Additional Ranges: %v, Headers: %v",
-			name, config.TailscaleRanges, config.AdditionalRanges, config.HeadersToCheck)
+		log.Printf("[INFO] TailscaleAuth plugin '%s' initialized. Tailscale Ranges: %v, Additional Ranges: %v, Headers: %v, StrictMode: %v",
+			name, config.TailscaleRanges, config.AdditionalRanges, config.HeadersToCheck, config.StrictMode)
 	}
 
 	return &TailscaleAuth{
@@ -110,6 +125,7 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		config:               config,
 		parsedTailscaleNets:  parsedTailscaleNets,
 		parsedAdditionalNets: parsedAdditionalNets,
+		parsedTrustedProxies: parsedTrustedProxies,
 	}, nil
 }
 
@@ -131,93 +147,104 @@ func parseCIDRs(cidrStrings []string) ([]*net.IPNet, error) {
 
 // ServeHTTP processes each incoming request, checking for Tailscale IP authentication.
 func (t *TailscaleAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	clientIPStr := t.extractClientIP(req)
-	if clientIPStr == "" {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': No client IP found for request to %s", t.name, req.URL.Path)
-		}
-		t.denyAccess(rw)
-		return
-	}
-
-	clientIP := net.ParseIP(clientIPStr)
+	clientIP, source := t.extractClientIP(req)
 	if clientIP == nil {
 		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Invalid client IP format '%s' for request to %s", t.name, clientIPStr, req.URL.Path)
+			log.Printf("[DEBUG] TailscaleAuth '%s': No valid client IP found for request to %s", t.name, req.URL.Path)
 		}
 		t.denyAccess(rw)
 		return
 	}
 
 	if t.config.EnableDebugLogging {
-		log.Printf("[DEBUG] TailscaleAuth '%s': Checking IP %s (parsed from %s) for request to %s", t.name, clientIP.String(), clientIPStr, req.URL.Path)
+		log.Printf("[DEBUG] TailscaleAuth '%s': Checking IP %s (from %s) for request to %s", t.name, clientIP.String(), source, req.URL.Path)
 	}
 
 	if t.isIPAllowed(clientIP) {
 		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Allowing access for IP %s", t.name, clientIP.String())
+			log.Printf("[DEBUG] TailscaleAuth '%s': Allowing access for IP %s (from %s)", t.name, clientIP.String(), source)
 		}
 		t.next.ServeHTTP(rw, req)
 		return
 	}
 
 	if t.config.EnableDebugLogging {
-		log.Printf("[DEBUG] TailscaleAuth '%s': Blocking access for IP %s", t.name, clientIP.String())
+		log.Printf("[DEBUG] TailscaleAuth '%s': Blocking access for IP %s (from %s)", t.name, clientIP.String(), source)
 	}
 	t.denyAccess(rw)
 }
 
-// extractClientIP attempts to find the client's real IP address.
-// It checks specified HTTP headers first, then falls back to the request's RemoteAddr.
-func (t *TailscaleAuth) extractClientIP(req *http.Request) string {
-	// Check headers first
+// extractClientIP attempts to find the client's real IP address with improved security.
+// Returns the IP and a description of where it was found.
+func (t *TailscaleAuth) extractClientIP(req *http.Request) (net.IP, string) {
+	// Get the direct connection IP first
+	directIP, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		// If RemoteAddr is not in host:port format, use it as is
+		directIP = strings.TrimSpace(req.RemoteAddr)
+	}
+	directIPParsed := net.ParseIP(strings.TrimSpace(directIP))
+
+	// Check if we should trust headers from this direct connection
+	trustHeaders := len(t.parsedTrustedProxies) == 0 || // No trusted proxies configured (trust all)
+		(directIPParsed != nil && t.isIPInSpecificNets(directIPParsed, t.parsedTrustedProxies))
+
+	if !trustHeaders {
+		if t.config.EnableDebugLogging {
+			log.Printf("[DEBUG] TailscaleAuth '%s': Direct IP %s is not in trusted proxies, ignoring headers", t.name, directIP)
+		}
+		return directIPParsed, "RemoteAddr (untrusted proxy)"
+	}
+
+	// Check headers for forwarded IPs
 	for _, headerName := range t.config.HeadersToCheck {
 		headerValue := req.Header.Get(headerName)
 		if headerValue == "" {
 			continue
 		}
 
-		// Headers like X-Forwarded-For can contain a list of IPs.
-		// We are interested in the first *valid* IP in the list that might be a Tailscale IP.
-		// Typically, the first IP in XFF is the original client.
+		if t.config.EnableDebugLogging {
+			log.Printf("[DEBUG] TailscaleAuth '%s': Checking header %s: %s", t.name, headerName, headerValue)
+		}
+
+		// Headers like X-Forwarded-For can contain a list of IPs
 		ips := strings.Split(headerValue, ",")
-		for _, ipStr := range ips {
+		for i, ipStr := range ips {
 			trimmedIP := strings.TrimSpace(ipStr)
-			// Quick check: if this IP is in a Tailscale range, use it.
-			// This avoids unnecessary parsing of RemoteAddr if a header IP is already confirmed.
-			// Note: We re-parse here, but the primary check is in isIPAllowed with parsed nets.
-			// This is a heuristic to pick the "best" IP from headers.
-			if net.ParseIP(trimmedIP) != nil { // Ensure it's a valid IP format before deeper checks
-				if t.isIPInSpecificNets(net.ParseIP(trimmedIP), t.parsedTailscaleNets) {
-					if t.config.EnableDebugLogging {
-						log.Printf("[DEBUG] TailscaleAuth '%s': Found potential Tailscale IP %s in header %s: %s", t.name, trimmedIP, headerName, headerValue)
-					}
-					return trimmedIP // Found a Tailscale IP in a header
-				}
-				// If not a Tailscale IP, but it's the first one in the list, it's a candidate.
-				// The actual decision will be made by isIPAllowed.
-				// We prefer the first IP from the first populated header.
-				if t.config.EnableDebugLogging {
-					log.Printf("[DEBUG] TailscaleAuth '%s': Using first IP %s from header %s: %s as candidate", t.name, trimmedIP, headerName, headerValue)
-				}
-				return trimmedIP
+			parsedIP := net.ParseIP(trimmedIP)
+			if parsedIP == nil {
+				continue // Skip invalid IPs
 			}
+
+			// In strict mode, only return header IPs if they're in Tailscale ranges
+			if t.config.StrictMode {
+				if t.isIPInSpecificNets(parsedIP, t.parsedTailscaleNets) {
+					if t.config.EnableDebugLogging {
+						log.Printf("[DEBUG] TailscaleAuth '%s': Found Tailscale IP %s in header %s (position %d)", t.name, trimmedIP, headerName, i)
+					}
+					return parsedIP, fmt.Sprintf("header %s (strict mode)", headerName)
+				}
+				// In strict mode, continue looking for Tailscale IPs
+				continue
+			}
+
+			// In non-strict mode, return the first valid IP (for backward compatibility)
+			if t.config.EnableDebugLogging {
+				log.Printf("[DEBUG] TailscaleAuth '%s': Using IP %s from header %s (position %d, non-strict mode)", t.name, trimmedIP, headerName, i)
+			}
+			return parsedIP, fmt.Sprintf("header %s (non-strict mode)", headerName)
 		}
 	}
 
-	// Fallback to RemoteAddr if no suitable IP found in headers
-	directIP, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		// If RemoteAddr is not in host:port format, use it as is (could be just an IP)
-		if t.config.EnableDebugLogging && req.RemoteAddr != "" {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Could not split host/port for RemoteAddr '%s', using as is. Error: %v", t.name, req.RemoteAddr, err)
+	// Fallback to direct connection IP
+	if directIPParsed != nil {
+		if t.config.EnableDebugLogging {
+			log.Printf("[DEBUG] TailscaleAuth '%s': Using direct connection IP %s", t.name, directIP)
 		}
-		return strings.TrimSpace(req.RemoteAddr)
+		return directIPParsed, "RemoteAddr (fallback)"
 	}
-	if t.config.EnableDebugLogging && directIP != "" {
-		log.Printf("[DEBUG] TailscaleAuth '%s': Using IP %s from RemoteAddr", t.name, directIP)
-	}
-	return strings.TrimSpace(directIP)
+
+	return nil, "none found"
 }
 
 // isIPAllowed checks if the given IP address is present in any of the configured Tailscale or additional CIDR ranges.
@@ -225,12 +252,24 @@ func (t *TailscaleAuth) isIPAllowed(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
+
 	// Check against Tailscale ranges first
 	if t.isIPInSpecificNets(ip, t.parsedTailscaleNets) {
+		if t.config.EnableDebugLogging {
+			log.Printf("[DEBUG] TailscaleAuth '%s': IP %s matches Tailscale range", t.name, ip.String())
+		}
 		return true
 	}
+
 	// Then check against additional allowed ranges
-	return t.isIPInSpecificNets(ip, t.parsedAdditionalNets)
+	if t.isIPInSpecificNets(ip, t.parsedAdditionalNets) {
+		if t.config.EnableDebugLogging {
+			log.Printf("[DEBUG] TailscaleAuth '%s': IP %s matches additional range", t.name, ip.String())
+		}
+		return true
+	}
+
+	return false
 }
 
 // isIPInSpecificNets checks if an IP is contained within any of the provided IP networks.

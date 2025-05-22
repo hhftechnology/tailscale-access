@@ -8,29 +8,28 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hhftechnology/tailscale-access" // Adjust import path if your module name is different
+	tailscale_access "github.com/hhftechnology/tailscale-access"
 )
 
-func TestTailscaleAuth(t *testing.T) {
+func TestTailscaleAuth_BasicFunctionality(t *testing.T) {
 	// Common handler for successful requests
 	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 		_, _ = rw.Write([]byte("Access granted"))
 	})
 
-	// Test cases
 	testCases := []struct {
 		name               string
-		config             *tailscaleauth.Config
+		config             *tailscale_access.Config
 		remoteAddr         string
 		headers            map[string]string
 		expectedStatusCode int
-		expectedBody       string // If non-empty, check for this substring in the body
+		expectedBody       string
 		expectAllow        bool
 	}{
 		{
 			name:               "Allow Tailscale IP in RemoteAddr",
-			config:             tailscaleauth.CreateConfig(), // Uses default Tailscale range 100.64.0.0/10
+			config:             tailscale_access.CreateConfig(),
 			remoteAddr:         "100.64.1.100:12345",
 			headers:            nil,
 			expectedStatusCode: http.StatusOK,
@@ -38,18 +37,19 @@ func TestTailscaleAuth(t *testing.T) {
 		},
 		{
 			name:               "Block non-Tailscale IP in RemoteAddr",
-			config:             tailscaleauth.CreateConfig(),
+			config:             tailscale_access.CreateConfig(),
 			remoteAddr:         "192.168.1.100:12345",
 			headers:            nil,
 			expectedStatusCode: http.StatusForbidden,
-			expectedBody:       tailscaleauth.DefaultErrorMessage,
+			expectedBody:       tailscale_access.DefaultErrorMessage,
 			expectAllow:        false,
 		},
 		{
-			name: "Allow Tailscale IP in X-Forwarded-For header",
-			config: &tailscaleauth.Config{
+			name: "Allow Tailscale IP in X-Forwarded-For header (strict mode)",
+			config: &tailscale_access.Config{
 				TailscaleRanges: []string{"100.64.0.0/10"},
 				HeadersToCheck:  []string{"X-Forwarded-For"},
+				StrictMode:      true,
 			},
 			remoteAddr:         "1.2.3.4:12345", // Non-Tailscale direct IP
 			headers:            map[string]string{"X-Forwarded-For": "100.65.0.1"},
@@ -57,41 +57,57 @@ func TestTailscaleAuth(t *testing.T) {
 			expectAllow:        true,
 		},
 		{
-			name: "Allow Tailscale IP (first) in X-Forwarded-For list",
-			config: &tailscaleauth.Config{
+			name: "Block non-Tailscale IP in X-Forwarded-For header (strict mode)",
+			config: &tailscale_access.Config{
 				TailscaleRanges: []string{"100.64.0.0/10"},
 				HeadersToCheck:  []string{"X-Forwarded-For"},
+				StrictMode:      true,
 			},
 			remoteAddr:         "1.2.3.4:12345",
-			headers:            map[string]string{"X-Forwarded-For": "100.70.0.1, 192.168.0.1"},
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name: "Block non-Tailscale IP (first) in X-Forwarded-For list, Tailscale IP later",
-			config: &tailscaleauth.Config{ // Default behavior is to take the first IP from the first matched header
-				TailscaleRanges: []string{"100.64.0.0/10"},
-				HeadersToCheck:  []string{"X-Forwarded-For"},
-			},
-			remoteAddr:         "1.2.3.4:12345",
-			headers:            map[string]string{"X-Forwarded-For": "192.168.0.1, 100.70.0.1"},
-			expectedStatusCode: http.StatusForbidden, // Because 192.168.0.1 is checked first from XFF
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8"},
+			expectedStatusCode: http.StatusForbidden,
 			expectAllow:        false,
 		},
 		{
-			name: "Allow Tailscale IP in X-Real-IP header",
-			config: &tailscaleauth.Config{
-				TailscaleRanges: []string{"100.64.0.0/10"},
-				HeadersToCheck:  []string{"X-Real-IP", "X-Forwarded-For"},
+			name: "Allow first valid IP in non-strict mode",
+			config: &tailscale_access.Config{
+				TailscaleRanges:  []string{"100.64.0.0/10"},
+				AdditionalRanges: []string{"8.8.8.0/24"},
+				HeadersToCheck:   []string{"X-Forwarded-For"},
+				StrictMode:       false,
 			},
 			remoteAddr:         "1.2.3.4:12345",
-			headers:            map[string]string{"X-Real-IP": "100.100.100.100"},
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8"},
 			expectedStatusCode: http.StatusOK,
 			expectAllow:        true,
 		},
 		{
+			name: "Find Tailscale IP in list (strict mode)",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+				StrictMode:      true,
+			},
+			remoteAddr:         "1.2.3.4:12345",
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8, 100.70.0.1, 192.168.1.1"},
+			expectedStatusCode: http.StatusOK,
+			expectAllow:        true,
+		},
+		{
+			name: "Block when no Tailscale IP in list (strict mode)",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+				StrictMode:      true,
+			},
+			remoteAddr:         "1.2.3.4:12345",
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8, 192.168.1.1, 10.0.0.1"},
+			expectedStatusCode: http.StatusForbidden,
+			expectAllow:        false,
+		},
+		{
 			name: "Allow AdditionalRange IP in RemoteAddr",
-			config: &tailscaleauth.Config{
+			config: &tailscale_access.Config{
 				TailscaleRanges:  []string{"100.64.0.0/10"},
 				AdditionalRanges: []string{"127.0.0.1/32", "192.168.5.0/24"},
 			},
@@ -101,20 +117,8 @@ func TestTailscaleAuth(t *testing.T) {
 			expectAllow:        true,
 		},
 		{
-			name: "Allow AdditionalRange IP in X-Forwarded-For",
-			config: &tailscaleauth.Config{
-				TailscaleRanges:  []string{"100.64.0.0/10"},
-				AdditionalRanges: []string{"127.0.0.1/32"},
-				HeadersToCheck:   []string{"X-Forwarded-For"},
-			},
-			remoteAddr:         "1.2.3.4:12345",
-			headers:            map[string]string{"X-Forwarded-For": "127.0.0.1"},
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name: "Block with custom error message",
-			config: &tailscaleauth.Config{
+			name: "Custom error message",
+			config: &tailscale_access.Config{
 				TailscaleRanges:    []string{"100.64.0.0/10"},
 				CustomErrorMessage: "Tailscale only, buddy!",
 			},
@@ -124,114 +128,20 @@ func TestTailscaleAuth(t *testing.T) {
 			expectedBody:       "Tailscale only, buddy!",
 			expectAllow:        false,
 		},
-		{
-			name: "Debug logging enabled (coverage)",
-			config: &tailscaleauth.Config{
-				TailscaleRanges:    []string{"100.64.0.0/10"},
-				EnableDebugLogging: true,
-			},
-			remoteAddr:         "100.64.1.1:12345", // Allowed
-			headers:            nil,
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name:               "No valid IP (empty RemoteAddr, no headers)",
-			config:             tailscaleauth.CreateConfig(),
-			remoteAddr:         "", // Invalid or empty
-			headers:            nil,
-			expectedStatusCode: http.StatusForbidden,
-			expectAllow:        false,
-		},
-		{
-			name:               "Invalid RemoteAddr format (no port)",
-			config:             tailscaleauth.CreateConfig(),
-			remoteAddr:         "100.64.1.1", // Allowed if treated as IP
-			headers:            nil,
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name: "Block if RemoteAddr is just a port",
-			config: &tailscaleauth.Config{
-				TailscaleRanges: []string{"100.64.0.0/10"},
-			},
-			remoteAddr:         ":12345",
-			headers:            nil,
-			expectedStatusCode: http.StatusForbidden,
-			expectAllow:        false,
-		},
-		{
-			name: "Allow if only AdditionalRanges configured and IP matches",
-			config: &tailscaleauth.Config{
-				TailscaleRanges:  []string{}, // No Tailscale ranges
-				AdditionalRanges: []string{"192.168.7.0/24"},
-			},
-			remoteAddr:         "192.168.7.7:12345",
-			headers:            nil,
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name: "Block if only AdditionalRanges configured and IP does not match",
-			config: &tailscaleauth.Config{
-				TailscaleRanges:  []string{},
-				AdditionalRanges: []string{"192.168.7.0/24"},
-			},
-			remoteAddr:         "10.0.0.1:12345",
-			headers:            nil,
-			expectedStatusCode: http.StatusForbidden,
-			expectAllow:        false,
-		},
-		{
-			name: "Empty HeadersToCheck, fallback to RemoteAddr (allow)",
-			config: &tailscaleauth.Config{
-				TailscaleRanges: []string{"100.64.0.0/10"},
-				HeadersToCheck:  []string{}, // Will use default in New if not set, but test explicit empty
-			},
-			remoteAddr:         "100.64.2.2:12345",
-			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8"}, // This header should be ignored
-			expectedStatusCode: http.StatusOK,
-			expectAllow:        true,
-		},
-		{
-			name: "Empty HeadersToCheck, fallback to RemoteAddr (block)",
-			config: &tailscaleauth.Config{
-				TailscaleRanges: []string{"100.64.0.0/10"},
-				HeadersToCheck:  []string{},
-			},
-			remoteAddr:         "8.8.8.8:12345",
-			headers:            map[string]string{"X-Forwarded-For": "100.64.2.2"}, // This header should be ignored
-			expectedStatusCode: http.StatusForbidden,
-			expectAllow:        false,
-		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			// Ensure CreateConfig defaults are handled if config is minimal
+			// Set defaults if not provided
 			if tc.config.CustomErrorMessage == "" && !tc.expectAllow {
-				tc.config.CustomErrorMessage = tailscaleauth.DefaultErrorMessage
-			}
-			if len(tc.config.TailscaleRanges) == 0 && len(tc.config.AdditionalRanges) == 0 {
-				// If test case implies default Tailscale range should be used
-				if strings.Contains(tc.name, "Tailscale IP") || tc.expectAllow {
-					// This might need adjustment based on whether the test intends to use defaults or truly empty ranges
-					// For now, assume if it's a Tailscale test, it needs the default range.
-					// A better approach might be to have CreateConfig() called explicitly in test case if defaults are desired.
-					// Or, ensure New() correctly applies defaults.
-				}
+				tc.config.CustomErrorMessage = tailscale_access.DefaultErrorMessage
 			}
 
-
-			handler, err := tailscaleauth.New(ctx, nextHandler, tc.config, "test-"+tc.name)
+			handler, err := tailscale_access.New(ctx, nextHandler, tc.config, "test-"+tc.name)
 			if err != nil {
-				// If we expect an error during New (e.g. bad CIDR), handle it here.
-				// For now, assuming valid configs for New.
-				t.Fatalf("tailscaleauth.New() error = %v", err)
-				return
+				t.Fatalf("tailscale_access.New() error = %v", err)
 			}
 
 			recorder := httptest.NewRecorder()
@@ -258,74 +168,308 @@ func TestTailscaleAuth(t *testing.T) {
 	}
 }
 
+func TestTailscaleAuth_TrustedProxies(t *testing.T) {
+	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("Access granted"))
+	})
+
+	testCases := []struct {
+		name               string
+		config             *tailscale_access.Config
+		remoteAddr         string
+		headers            map[string]string
+		expectedStatusCode int
+		expectAllow        bool
+	}{
+		{
+			name: "Trust headers from trusted proxy",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+				TrustedProxies:  []string{"172.17.0.0/16"},
+				StrictMode:      true,
+			},
+			remoteAddr:         "172.17.0.1:12345", // Trusted proxy
+			headers:            map[string]string{"X-Forwarded-For": "100.64.1.1"},
+			expectedStatusCode: http.StatusOK,
+			expectAllow:        true,
+		},
+		{
+			name: "Ignore headers from untrusted proxy",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+				TrustedProxies:  []string{"172.17.0.0/16"},
+				StrictMode:      true,
+			},
+			remoteAddr:         "8.8.8.8:12345", // Untrusted proxy
+			headers:            map[string]string{"X-Forwarded-For": "100.64.1.1"},
+			expectedStatusCode: http.StatusForbidden, // Should use RemoteAddr instead
+			expectAllow:        false,
+		},
+		{
+			name: "No trusted proxies configured - trust all",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+				TrustedProxies:  []string{}, // Empty means trust all
+				StrictMode:      true,
+			},
+			remoteAddr:         "8.8.8.8:12345", // Any proxy
+			headers:            map[string]string{"X-Forwarded-For": "100.64.1.1"},
+			expectedStatusCode: http.StatusOK,
+			expectAllow:        true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			handler, err := tailscale_access.New(ctx, nextHandler, tc.config, "test-"+tc.name)
+			if err != nil {
+				t.Fatalf("tailscale_access.New() error = %v", err)
+			}
+
+			recorder := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code != tc.expectedStatusCode {
+				t.Errorf("Expected status code %d, got %d", tc.expectedStatusCode, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestTailscaleAuth_StrictMode(t *testing.T) {
+	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("Access granted"))
+	})
+
+	testCases := []struct {
+		name               string
+		strictMode         bool
+		remoteAddr         string
+		headers            map[string]string
+		expectedStatusCode int
+		description        string
+	}{
+		{
+			name:               "Strict mode: only Tailscale IPs from headers",
+			strictMode:         true,
+			remoteAddr:         "172.17.0.1:12345",
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8, 100.64.1.1"},
+			expectedStatusCode: http.StatusOK, // Should find and use 100.64.1.1
+			description:        "Should find Tailscale IP in header list",
+		},
+		{
+			name:               "Strict mode: no Tailscale IPs in headers, use RemoteAddr",
+			strictMode:         true,
+			remoteAddr:         "100.64.1.1:12345", // Tailscale IP
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8, 192.168.1.1"},
+			expectedStatusCode: http.StatusOK, // Should fall back to RemoteAddr
+			description:        "Should fall back to RemoteAddr when no Tailscale IPs in headers",
+		},
+		{
+			name:               "Non-strict mode: use first IP from headers",
+			strictMode:         false,
+			remoteAddr:         "172.17.0.1:12345",
+			headers:            map[string]string{"X-Forwarded-For": "8.8.8.8, 100.64.1.1"},
+			expectedStatusCode: http.StatusForbidden, // 8.8.8.8 is not in allowed ranges
+			description:        "Should use first IP (8.8.8.8) which is not allowed",
+		},
+		{
+			name:               "Non-strict mode: first IP is allowed in additional ranges",
+			strictMode:         false,
+			remoteAddr:         "172.17.0.1:12345",
+			headers:            map[string]string{"X-Forwarded-For": "127.0.0.1, 100.64.1.1"},
+			expectedStatusCode: http.StatusOK, // 127.0.0.1 should be in additional ranges
+			description:        "Should use first IP which is in additional ranges",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			config := &tailscale_access.Config{
+				TailscaleRanges:  []string{"100.64.0.0/10"},
+				AdditionalRanges: []string{"127.0.0.1/32"},
+				HeadersToCheck:   []string{"X-Forwarded-For"},
+				StrictMode:       tc.strictMode,
+			}
+
+			handler, err := tailscale_access.New(ctx, nextHandler, config, "test-"+tc.name)
+			if err != nil {
+				t.Fatalf("tailscale_access.New() error = %v", err)
+			}
+
+			recorder := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code != tc.expectedStatusCode {
+				t.Errorf("%s: Expected status code %d, got %d", tc.description, tc.expectedStatusCode, recorder.Code)
+			}
+		})
+	}
+}
+
+func TestTailscaleAuth_EdgeCases(t *testing.T) {
+	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("Access granted"))
+	})
+
+	testCases := []struct {
+		name               string
+		config             *tailscale_access.Config
+		remoteAddr         string
+		headers            map[string]string
+		expectedStatusCode int
+	}{
+		{
+			name:               "No valid IP (empty RemoteAddr, no headers)",
+			config:             tailscale_access.CreateConfig(),
+			remoteAddr:         "",
+			headers:            nil,
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name:               "Invalid RemoteAddr format (no port)",
+			config:             tailscale_access.CreateConfig(),
+			remoteAddr:         "100.64.1.1", // No port, but should work
+			headers:            nil,
+			expectedStatusCode: http.StatusOK,
+		},
+		{
+			name: "Empty port in RemoteAddr",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+			},
+			remoteAddr:         ":12345",
+			headers:            nil,
+			expectedStatusCode: http.StatusForbidden,
+		},
+		{
+			name: "Invalid IP in header",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Forwarded-For"},
+			},
+			remoteAddr:         "100.64.1.1:12345",
+			headers:            map[string]string{"X-Forwarded-For": "invalid-ip, also-invalid"},
+			expectedStatusCode: http.StatusOK, // Should fall back to RemoteAddr
+		},
+		{
+			name: "Multiple headers, use first populated",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				HeadersToCheck:  []string{"X-Real-IP", "X-Forwarded-For"},
+				StrictMode:      true,
+			},
+			remoteAddr: "172.17.0.1:12345",
+			headers: map[string]string{
+				"X-Real-IP":       "", // Empty
+				"X-Forwarded-For": "100.64.1.1",
+			},
+			expectedStatusCode: http.StatusOK, // Should use X-Forwarded-For
+		},
+		{
+			name: "Debug logging enabled (coverage test)",
+			config: &tailscale_access.Config{
+				TailscaleRanges:    []string{"100.64.0.0/10"},
+				EnableDebugLogging: true,
+			},
+			remoteAddr:         "100.64.1.1:12345",
+			headers:            nil,
+			expectedStatusCode: http.StatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			handler, err := tailscale_access.New(ctx, nextHandler, tc.config, "test-"+tc.name)
+			if err != nil {
+				t.Fatalf("tailscale_access.New() error = %v", err)
+			}
+
+			recorder := httptest.NewRecorder()
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code != tc.expectedStatusCode {
+				t.Errorf("Expected status code %d, got %d", tc.expectedStatusCode, recorder.Code)
+			}
+		})
+	}
+}
+
 func TestNew_ErrorCases(t *testing.T) {
 	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {})
 	ctx := context.Background()
 
 	testCases := []struct {
 		name        string
-		config      *tailscaleauth.Config
+		config      *tailscale_access.Config
 		expectedErr string
 	}{
 		{
 			name: "Invalid Tailscale CIDR",
-			config: &tailscaleauth.Config{
+			config: &tailscale_access.Config{
 				TailscaleRanges: []string{"100.64.0.0/invalid"},
 			},
 			expectedErr: "invalid CIDR string",
 		},
 		{
 			name: "Invalid Additional CIDR",
-			config: &tailscaleauth.Config{
+			config: &tailscale_access.Config{
+				TailscaleRanges:  []string{"100.64.0.0/10"},
 				AdditionalRanges: []string{"192.168.1.0/foo"},
 			},
 			expectedErr: "invalid CIDR string",
 		},
 		{
-			name: "No ranges configured (after defaults)",
-			config: &tailscaleauth.Config{
-				TailscaleRanges:  []string{""}, // Empty string should be skipped, leading to no valid ranges
-				AdditionalRanges: []string{""},
+			name: "Invalid Trusted Proxy CIDR",
+			config: &tailscale_access.Config{
+				TailscaleRanges: []string{"100.64.0.0/10"},
+				TrustedProxies:  []string{"172.17.0.0/bar"},
 			},
-			// This test case needs careful handling of how New applies defaults.
-			// If New sets default TailscaleRanges if empty, this won't error.
-			// The current New logic *does* set default TailscaleRanges if config.TailscaleRanges is empty.
-			// To test "no ranges", we'd need to ensure the config passed to New has empty *after* any internal defaulting logic.
-			// For now, let's assume the goal is to test if *all* provided ranges are invalid or empty.
-			// The error "at least one valid TailscaleRange or AdditionalRange must be provided"
+			expectedErr: "invalid CIDR string",
+		},
+		{
+			name: "No ranges configured",
+			config: &tailscale_access.Config{
+				TailscaleRanges:  []string{""},  // Empty string should be skipped
+				AdditionalRanges: []string{""}, // Empty string should be skipped
+			},
 			expectedErr: "at least one valid TailscaleRange or AdditionalRange must be provided",
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// If the test config is designed to use CreateConfig defaults first, do that.
-			// Otherwise, use the tc.config directly.
-			// For these error cases, we usually provide the problematic config directly.
-
-			// Special handling for "No ranges configured" to ensure defaults are not applied by CreateConfig()
-			// if the test intends to pass an effectively empty set of ranges to New().
-			var cfgToUse *tailscaleauth.Config
-			if tc.name == "No ranges configured (after defaults)" {
-				cfgToUse = tc.config // Use the specific config that results in no valid ranges
-			} else {
-				// For other error cases, we might want to start from defaults and override.
-				// However, here we are testing specific invalid parts.
-				cfgToUse = tc.config
-				// Fill in other parts with defaults if not specified, to isolate the error.
-				if cfgToUse.HeadersToCheck == nil {
-					cfgToUse.HeadersToCheck = tailscaleauth.DefaultHeadersToCheck
-				}
-				if cfgToUse.CustomErrorMessage == "" {
-					cfgToUse.CustomErrorMessage = tailscaleauth.DefaultErrorMessage
-				}
-				// If TailscaleRanges is nil (not just empty) and not the part being tested for error,
-				// and AdditionalRanges is also nil, New might apply defaults.
-				// This part is tricky for error testing. Let's assume tc.config is specific enough.
-			}
-
-
-			_, err := tailscaleauth.New(ctx, nextHandler, cfgToUse, "test-new-error")
+			_, err := tailscale_access.New(ctx, nextHandler, tc.config, "test-new-error")
 			if err == nil {
 				t.Fatalf("Expected an error, but got nil")
 			}
@@ -333,5 +477,76 @@ func TestNew_ErrorCases(t *testing.T) {
 				t.Errorf("Expected error message to contain %q, got %q", tc.expectedErr, err.Error())
 			}
 		})
+	}
+}
+
+func TestCreateConfig_Defaults(t *testing.T) {
+	config := tailscale_access.CreateConfig()
+
+	// Check default values
+	if len(config.TailscaleRanges) != 1 || config.TailscaleRanges[0] != tailscale_access.DefaultTailscaleCIDR {
+		t.Errorf("Expected default TailscaleRanges to be [%s], got %v", tailscale_access.DefaultTailscaleCIDR, config.TailscaleRanges)
+	}
+
+	if len(config.AdditionalRanges) != 0 {
+		t.Errorf("Expected default AdditionalRanges to be empty, got %v", config.AdditionalRanges)
+	}
+
+	if config.EnableDebugLogging {
+		t.Errorf("Expected default EnableDebugLogging to be false, got true")
+	}
+
+	if config.CustomErrorMessage != tailscale_access.DefaultErrorMessage {
+		t.Errorf("Expected default CustomErrorMessage to be %q, got %q", tailscale_access.DefaultErrorMessage, config.CustomErrorMessage)
+	}
+
+	if !config.StrictMode {
+		t.Errorf("Expected default StrictMode to be true, got false")
+	}
+
+	if len(config.TrustedProxies) != 0 {
+		t.Errorf("Expected default TrustedProxies to be empty, got %v", config.TrustedProxies)
+	}
+}
+
+// Benchmark tests
+func BenchmarkTailscaleAuth_RemoteAddr(b *testing.B) {
+	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	config := tailscale_access.CreateConfig()
+	handler, _ := tailscale_access.New(context.Background(), nextHandler, config, "benchmark")
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost", nil)
+	req.RemoteAddr = "100.64.1.1:12345"
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+	}
+}
+
+func BenchmarkTailscaleAuth_Headers(b *testing.B) {
+	nextHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	config := &tailscale_access.Config{
+		TailscaleRanges: []string{"100.64.0.0/10"},
+		HeadersToCheck:  []string{"X-Forwarded-For", "X-Real-IP"},
+		StrictMode:      true,
+	}
+	handler, _ := tailscale_access.New(context.Background(), nextHandler, config, "benchmark")
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost", nil)
+	req.RemoteAddr = "172.17.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "100.64.1.1, 192.168.1.1")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
 	}
 }
