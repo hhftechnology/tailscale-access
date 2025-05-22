@@ -31,9 +31,9 @@ In your main Traefik configuration file, add the plugin declaration to the exper
 # traefik.yml or docker-compose command
 experimental:
   plugins:
-    tailscale-auth:
-      moduleName: github.com/hhftechnology/tailscale-access
-      version: v1.0.0
+    tailscale-auth: # This is a user-defined name for your plugin instance
+      moduleName: [github.com/hhftechnology/tailscale-access](https://github.com/hhftechnology/tailscale-access)
+      version: v1.0.0 # Replace with your plugin's version or local path
 ```
 
 ### Step 2: Configure the Middleware
@@ -44,9 +44,9 @@ Create or update your dynamic configuration to define how the middleware should 
 # dynamic-config.yml or rules file
 http:
   middlewares:
-    tailscale-access:
+    tailscale-access-middleware: # User-defined name for this middleware instance
       plugin:
-        tailscale-access:
+        tailscaleauth: # Use the Go package name 'tailscaleauth' here
           tailscaleRanges:
             - "100.64.0.0/10"  # Standard Tailscale CGNAT range
           additionalRanges:
@@ -71,7 +71,7 @@ http:
       rule: "Host(`myapp.example.com`)"
       service: "my-backend-service"
       middlewares:
-        - "tailscale-access"
+        - "tailscale-access-middleware" # Reference the middleware instance name defined above
 ```
 
 ## Configuration Options
@@ -83,9 +83,11 @@ Understanding each configuration option helps you tailor the plugin to your spec
 This array defines which IP address ranges should be considered valid Tailscale connections. The default value covers Tailscale's standard CGNAT range, but you might need to customize this if you're using different network configurations.
 
 ```yaml
-tailscaleRanges:
-  - "100.64.0.0/10"     # Standard Tailscale range
-  - "10.0.0.0/8"        # Custom private range if you've configured Tailscale differently
+# Example for the dynamic configuration under 'plugin.tailscaleauth'
+# tailscaleauth:
+#   tailscaleRanges:
+#     - "100.64.0.0/10"     # Standard Tailscale range
+#     - "10.0.0.0/8"        # Custom private range if you've configured Tailscale differently
 ```
 
 The plugin will allow access from any IP address that falls within these ranges. Tailscale typically uses the 100.64.0.0/10 range for its CGNAT implementation, which provides each device with a unique IP in this space.
@@ -95,10 +97,12 @@ The plugin will allow access from any IP address that falls within these ranges.
 Sometimes you need to allow access from non-Tailscale sources, such as local development environments or trusted proxy servers. This option lets you specify additional IP ranges that should be granted access.
 
 ```yaml
-additionalRanges:
-  - "127.0.0.1/32"      # Localhost for development
-  - "192.168.1.0/24"    # Local network for testing
-  - "10.0.0.0/8"        # Corporate network range
+# Example for the dynamic configuration under 'plugin.tailscaleauth'
+# tailscaleauth:
+#   additionalRanges:
+#     - "127.0.0.1/32"      # Localhost for development
+#     - "192.168.1.0/24"    # Local network for testing
+#     - "10.0.0.0/8"        # Corporate network range
 ```
 
 This is particularly useful during development and testing phases, or when you have legitimate non-Tailscale sources that need access to your protected resources.
@@ -108,13 +112,15 @@ This is particularly useful during development and testing phases, or when you h
 This configuration tells the plugin which HTTP headers might contain the real client IP address. Different proxy servers and load balancers use different header names to preserve the original client IP information.
 
 ```yaml
-headersToCheck:
-  - "X-Forwarded-For"
-  - "X-Real-IP"
-  - "X-Original-Forwarded-For"
-  - "CF-Connecting-IP"
-  - "True-Client-IP"
-  - "X-Client-IP"
+# Example for the dynamic configuration under 'plugin.tailscaleauth'
+# tailscaleauth:
+#   headersToCheck:
+#     - "X-Forwarded-For"
+#     - "X-Real-IP"
+#     - "X-Original-Forwarded-For"
+#     - "CF-Connecting-IP"
+#     - "True-Client-IP"
+#     - "X-Client-IP"
 ```
 
 The plugin will examine these headers in the order you specify them, looking for valid Tailscale IP addresses. This is crucial for setups where the client IP has been transformed by reverse proxies or container networking.
@@ -124,7 +130,9 @@ The plugin will examine these headers in the order you specify them, looking for
 When set to true, this option provides detailed information about how the plugin is processing each request. This is invaluable for troubleshooting networking issues and understanding how your traffic is being routed.
 
 ```yaml
-enableDebugLogging: true
+# Example for the dynamic configuration under 'plugin.tailscaleauth'
+# tailscaleauth:
+#   enableDebugLogging: true
 ```
 
 The debug output shows which IP addresses were found in which locations, which headers were checked, and what decisions the plugin made. However, you should disable this in production environments to avoid performance impacts and log clutter.
@@ -134,7 +142,9 @@ The debug output shows which IP addresses were found in which locations, which h
 This allows you to customize the message that users see when they're denied access. A clear, helpful message can guide users toward the correct way to access your resources.
 
 ```yaml
-customErrorMessage: "Access denied: Please connect via Tailscale to access this resource. Visit https://tailscale.com/kb/1017/install for setup instructions."
+# Example for the dynamic configuration under 'plugin.tailscaleauth'
+# tailscaleauth:
+#   customErrorMessage: "Access denied: Please connect via Tailscale to access this resource. Visit [https://tailscale.com/kb/1017/install](https://tailscale.com/kb/1017/install) for setup instructions."
 ```
 
 ## Use Cases and Examples
@@ -150,7 +160,7 @@ http:
   middlewares:
     company-tailscale-auth:
       plugin:
-        tailscale-access:
+        tailscaleauth: # Corrected
           tailscaleRanges:
             - "100.64.0.0/10"
           customErrorMessage: "This internal tool requires a company Tailscale connection. Contact IT for setup assistance."
@@ -166,7 +176,7 @@ http:
   middlewares:
     dev-access:
       plugin:
-        tailscale-access:
+        tailscaleauth: # Corrected
           tailscaleRanges:
             - "100.64.0.0/10"
           additionalRanges:
@@ -187,7 +197,7 @@ http:
   middlewares:
     multi-proxy-tailscale:
       plugin:
-        tailscale-access:
+        tailscaleauth: # Corrected
           tailscaleRanges:
             - "100.64.0.0/10"
           headersToCheck:
@@ -206,11 +216,11 @@ Add this to your `templates.yaml` file:
 
 ```yaml
 middlewares:
-  - id: "tailscale-access"
+  - id: "tailscale-auth-template" # Changed ID for clarity
     name: "Tailscale Authentication"
     type: "plugin"
     config:
-      tailscale-access:
+      tailscaleauth: # Corrected
         tailscaleRanges:
           - "100.64.0.0/10"
         additionalRanges:
@@ -231,10 +241,17 @@ When the plugin isn't working as expected, systematic troubleshooting helps iden
 
 ### Enable Debug Logging First
 
-The most effective way to understand what's happening is to enable debug logging temporarily:
+The most effective way to understand what's happening is to enable debug logging temporarily in your dynamic configuration for the middleware:
 
 ```yaml
-enableDebugLogging: true
+# Example in your dynamic configuration
+# http:
+#   middlewares:
+#     your-middleware-name:
+#       plugin:
+#         tailscaleauth:
+#           enableDebugLogging: true
+#           # ... other settings
 ```
 
 This will show you exactly what IP addresses the plugin is finding and where it's finding them. Look for log entries like:
@@ -258,7 +275,7 @@ This will show you exactly what IP addresses the plugin is finding and where it'
 **Solution**: Verify that your `tailscaleRanges` and `additionalRanges` are configured correctly. Remove any overly broad ranges that might be allowing unwanted traffic.
 
 **Problem**: No debug logs appearing
-**Solution**: Ensure the plugin is actually being applied to your routes. Check that the middleware is correctly referenced in your router configuration.
+**Solution**: Ensure the plugin is actually being applied to your routes. Check that the middleware is correctly referenced in your router configuration, and that the middleware instance using the plugin is correctly defined.
 
 ### Verifying Your Tailscale IP Range
 
@@ -279,16 +296,16 @@ Create a local development environment:
 
 ```bash
 # Clone or create your plugin repository
-mkdir tailscale-access
+mkdir tailscale-access # This directory name should match the last part of your moduleName
 cd tailscale-access
 
 # Initialize Go module
-go mod init github.com/hhftechnology/tailscale-access
+go mod init [github.com/hhftechnology/tailscale-access](https://github.com/hhftechnology/tailscale-access)
 
 # Create the basic structure
-touch tailscale-access.go
-touch tailscale-access.go
-touch .traefik.yml
+touch tailscale-access.go # Contains 'package tailscaleauth'
+touch tailscale-access_test.go # Contains 'package tailscaleauth_test'
+touch .traefik.yml # Describes the plugin to Traefik Pilot
 ```
 
 ### Testing Changes
@@ -303,9 +320,10 @@ For testing with Traefik's Yaegi interpreter (which is how plugins actually run)
 
 ```bash
 # Install yaegi for testing
-go install github.com/traefik/yaegi/cmd/yaegi@latest
+# Ensure you have Go installed, then:
+go install [github.com/traefik/yaegi/cmd/yaegi@latest](https://github.com/traefik/yaegi/cmd/yaegi@latest)
 
-# Test with yaegi
+# Test with yaegi (from the root of your plugin directory)
 yaegi test -v .
 ```
 
