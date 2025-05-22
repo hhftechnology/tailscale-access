@@ -1,12 +1,13 @@
-displayName: Demo Plugin
+displayName: Tailscale Access Only
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/traefik/plugindemo
+import: github.com/yourusername/tailscale-access
 
-summary: '[Demo] Add Request Header'
+summary: 'Allows access only to clients connected via Tailscale'
 
 testData:
-  Headers:
-    X-Demo: test
-    X-URL: '{{URL}}'
+  TailscaleRanges:
+    - "100.64.0.0/10"
+  EnableDebugLogging: true
+  CustomErrorMessage: "Access denied: Tailscale connection required"

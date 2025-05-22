@@ -1,3 +1,3 @@
-module github.com/traefik/plugindemo
+module github.com/hhftechnology/tailscale-access
 
 go 1.19

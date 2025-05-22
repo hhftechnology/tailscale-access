@@ -1,270 +1,332 @@
-This repository includes an example plugin, `demo`, for you to use as a reference for developing your own plugins.
+# Tailscale Authentication Plugin for Traefik
 
-[![Build Status](https://github.com/traefik/plugindemo/workflows/Main/badge.svg?branch=master)](https://github.com/traefik/plugindemo/actions)
+A middleware plugin that provides secure access control by allowing only Tailscale-connected clients to reach your protected resources. This plugin solves the complex challenge of identifying real client IPs in networking setups where standard IP allowlists fail.
 
-The existing plugins can be browsed into the [Plugin Catalog](https://plugins.traefik.io).
+## The Problem This Solves
 
-# Developing a Traefik plugin
+Standard Traefik middlewares like `ipAllowList` work well in simple networking scenarios where the client IP is directly visible. However, when you're running Tailscale with reverse proxies like Gerbil, Docker network mode sharing, and multiple networking layers, the original Tailscale IP often gets buried or transformed in ways that make it invisible to traditional IP filtering.
 
-[Traefik](https://traefik.io) plugins are developed using the [Go language](https://golang.org).
 
-A [Traefik](https://traefik.io) middleware plugin is just a [Go package](https://golang.org/ref/spec#Packages) that provides an `http.Handler` to perform specific processing of requests and responses.
+## Features
 
-Rather than being pre-compiled and linked, however, plugins are executed on the fly by [Yaegi](https://github.com/traefik/yaegi), an embedded Go interpreter.
+**Intelligent IP Detection**: The plugin doesn't just look at the immediate connection IP. It systematically examines multiple HTTP headers and connection sources to find the real Tailscale client IP, even when it's been transformed by proxies or container networking.
 
-## Usage
+**Tailscale-Aware Logic**: Unlike generic IP filters, this plugin understands Tailscale's networking model and can correctly identify valid Tailscale connections regardless of how they've been routed through your infrastructure.
 
-For a plugin to be active for a given Traefik instance, it must be declared in the static configuration.
+**Comprehensive Debugging**: When troubleshooting networking issues, the plugin provides detailed logging that shows exactly where it found (or didn't find) the client IP, making it much easier to diagnose complex networking problems.
 
-Plugins are parsed and loaded exclusively during startup, which allows Traefik to check the integrity of the code and catch errors early on.
-If an error occurs during loading, the plugin is disabled.
+**Flexible Configuration**: You can customize which IP ranges are considered valid, which headers to examine for client IPs, and how the plugin behaves in different scenarios.
 
-For security reasons, it is not possible to start a new plugin or modify an existing one while Traefik is running.
+**Production Ready**: The plugin includes proper error handling, validation, and performance optimizations suitable for production environments.
 
-Once loaded, middleware plugins behave exactly like statically compiled middlewares.
-Their instantiation and behavior are driven by the dynamic configuration.
+## Installation
 
-Plugin dependencies must be [vendored](https://golang.org/ref/mod#vendoring) for each plugin.
-Vendored packages should be included in the plugin's GitHub repository. ([Go modules](https://blog.golang.org/using-go-modules) are not supported.)
+Installing this plugin requires adding it to your Traefik static configuration and then referencing it in your dynamic configuration. The process involves two main steps: telling Traefik about the plugin's existence and then configuring how it should behave.
 
-### Configuration
+### Step 1: Add to Traefik Static Configuration
 
-For each plugin, the Traefik static configuration must define the module name (as is usual for Go packages).
-
-The following declaration (given here in YAML) defines a plugin:
+In your main Traefik configuration file, add the plugin declaration to the experimental plugins section:
 
 ```yaml
-# Static configuration
-
+# traefik.yml or docker-compose command
 experimental:
   plugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
-      version: v0.2.1
+    tailscale-auth:
+      moduleName: github.com/hhftechnology/tailscale-access
+      version: v1.0.0
 ```
 
-Here is an example of a file provider dynamic configuration (given here in YAML), where the interesting part is the `http.middlewares` section:
+### Step 2: Configure the Middleware
+
+Create or update your dynamic configuration to define how the middleware should behave:
 
 ```yaml
-# Dynamic configuration
+# dynamic-config.yml or rules file
+http:
+  middlewares:
+    tailscale-access:
+      plugin:
+        tailscale-access:
+          tailscaleRanges:
+            - "100.64.0.0/10"  # Standard Tailscale CGNAT range
+          additionalRanges:
+            - "127.0.0.1/32"   # Allow localhost for testing
+          enableDebugLogging: true
+          customErrorMessage: "Access denied: Please connect via Tailscale to access this resource"
+          headersToCheck:
+            - "X-Forwarded-For"
+            - "X-Real-IP"
+            - "X-Original-Forwarded-For"
+            - "CF-Connecting-IP"
+```
 
+### Step 3: Apply to Your Routes
+
+Once the middleware is defined, you can apply it to any route that should be protected:
+
+```yaml
 http:
   routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
+    protected-service:
+      rule: "Host(`myapp.example.com`)"
+      service: "my-backend-service"
       middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
-  middlewares:
-    my-plugin:
-      plugin:
-        example:
-          headers:
-            Foo: Bar
+        - "tailscale-access"
 ```
 
-### Local Mode
+## Configuration Options
 
-Traefik also offers a developer mode that can be used for temporary testing of plugins not hosted on GitHub.
-To use a plugin in local mode, the Traefik static configuration must define the module name (as is usual for Go packages) and a path to a [Go workspace](https://golang.org/doc/gopath_code.html#Workspaces), which can be the local GOPATH or any directory.
+Understanding each configuration option helps you tailor the plugin to your specific networking environment and security requirements.
 
-The plugins must be placed in `./plugins-local` directory,
-which should be in the working directory of the process running the Traefik binary.
-The source code of the plugin should be organized as follows:
+### tailscaleRanges
 
-```
-./plugins-local/
-    └── src
-        └── github.com
-            └── traefik
-                └── plugindemo
-                    ├── demo.go
-                    ├── demo_test.go
-                    ├── go.mod
-                    ├── LICENSE
-                    ├── Makefile
-                    └── readme.md
-```
+This array defines which IP address ranges should be considered valid Tailscale connections. The default value covers Tailscale's standard CGNAT range, but you might need to customize this if you're using different network configurations.
 
 ```yaml
-# Static configuration
-
-experimental:
-  localPlugins:
-    example:
-      moduleName: github.com/traefik/plugindemo
+tailscaleRanges:
+  - "100.64.0.0/10"     # Standard Tailscale range
+  - "10.0.0.0/8"        # Custom private range if you've configured Tailscale differently
 ```
 
-(In the above example, the `plugindemo` plugin will be loaded from the path `./plugins-local/src/github.com/traefik/plugindemo`.)
+The plugin will allow access from any IP address that falls within these ranges. Tailscale typically uses the 100.64.0.0/10 range for its CGNAT implementation, which provides each device with a unique IP in this space.
+
+### additionalRanges
+
+Sometimes you need to allow access from non-Tailscale sources, such as local development environments or trusted proxy servers. This option lets you specify additional IP ranges that should be granted access.
 
 ```yaml
-# Dynamic configuration
+additionalRanges:
+  - "127.0.0.1/32"      # Localhost for development
+  - "192.168.1.0/24"    # Local network for testing
+  - "10.0.0.0/8"        # Corporate network range
+```
 
+This is particularly useful during development and testing phases, or when you have legitimate non-Tailscale sources that need access to your protected resources.
+
+### headersToCheck
+
+This configuration tells the plugin which HTTP headers might contain the real client IP address. Different proxy servers and load balancers use different header names to preserve the original client IP information.
+
+```yaml
+headersToCheck:
+  - "X-Forwarded-For"
+  - "X-Real-IP"
+  - "X-Original-Forwarded-For"
+  - "CF-Connecting-IP"
+  - "True-Client-IP"
+  - "X-Client-IP"
+```
+
+The plugin will examine these headers in the order you specify them, looking for valid Tailscale IP addresses. This is crucial for setups where the client IP has been transformed by reverse proxies or container networking.
+
+### enableDebugLogging
+
+When set to true, this option provides detailed information about how the plugin is processing each request. This is invaluable for troubleshooting networking issues and understanding how your traffic is being routed.
+
+```yaml
+enableDebugLogging: true
+```
+
+The debug output shows which IP addresses were found in which locations, which headers were checked, and what decisions the plugin made. However, you should disable this in production environments to avoid performance impacts and log clutter.
+
+### customErrorMessage
+
+This allows you to customize the message that users see when they're denied access. A clear, helpful message can guide users toward the correct way to access your resources.
+
+```yaml
+customErrorMessage: "Access denied: Please connect via Tailscale to access this resource. Visit https://tailscale.com/kb/1017/install for setup instructions."
+```
+
+## Use Cases and Examples
+
+Understanding when and how to use this plugin helps you apply it effectively in different scenarios.
+
+### Scenario 1: Protecting Internal Services
+
+Suppose you're running internal company tools that should only be accessible to employees with Tailscale installed. Traditional IP allowlists become cumbersome because employees work from different locations with different external IPs.
+
+```yaml
 http:
-  routers:
-    my-router:
-      rule: host(`demo.localhost`)
-      service: service-foo
-      entryPoints:
-        - web
-      middlewares:
-        - my-plugin
-
-  services:
-   service-foo:
-      loadBalancer:
-        servers:
-          - url: http://127.0.0.1:5000
-  
   middlewares:
-    my-plugin:
+    company-tailscale-auth:
       plugin:
-        example:
-          headers:
-            Foo: Bar
+        tailscale-access:
+          tailscaleRanges:
+            - "100.64.0.0/10"
+          customErrorMessage: "This internal tool requires a company Tailscale connection. Contact IT for setup assistance."
+          enableDebugLogging: false  # Disabled for production
 ```
 
-## Defining a Plugin
+### Scenario 2: Development Environment Access
 
-A plugin package must define the following exported Go objects:
-
-- A type `type Config struct { ... }`. The struct fields are arbitrary.
-- A function `func CreateConfig() *Config`.
-- A function `func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error)`.
-
-```go
-// Package example a example plugin.
-package example
-
-import (
-	"context"
-	"net/http"
-)
-
-// Config the plugin configuration.
-type Config struct {
-	// ...
-}
-
-// CreateConfig creates the default plugin configuration.
-func CreateConfig() *Config {
-	return &Config{
-		// ...
-	}
-}
-
-// Example a plugin.
-type Example struct {
-	next     http.Handler
-	name     string
-	// ...
-}
-
-// New created a new plugin.
-func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// ...
-	return &Example{
-		// ...
-	}, nil
-}
-
-func (e *Example) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// ...
-	e.next.ServeHTTP(rw, req)
-}
-```
-
-## Logs
-
-Currently, the only way to send logs to Traefik is to use `os.Stdout.WriteString("...")` or `os.Stderr.WriteString("...")`.
-
-In the future, we will try to provide something better and based on levels.
-
-## Plugins Catalog
-
-Traefik plugins are stored and hosted as public GitHub repositories.
-
-Every 30 minutes, the Plugins Catalog online service polls Github to find plugins and add them to its catalog.
-
-### Prerequisites
-
-To be recognized by Plugins Catalog, your repository must meet the following criteria:
-
-- The `traefik-plugin` topic must be set.
-- The `.traefik.yml` manifest must exist, and be filled with valid contents.
-
-If your repository fails to meet either of these prerequisites, Plugins Catalog will not see it.
-
-### Manifest
-
-A manifest is also mandatory, and it should be named `.traefik.yml` and stored at the root of your project.
-
-This YAML file provides Plugins Catalog with information about your plugin, such as a description, a full name, and so on.
-
-Here is an example of a typical `.traefik.yml`file:
+For development environments, you might want to allow both Tailscale access and local development access, while still blocking external traffic.
 
 ```yaml
-# The name of your plugin as displayed in the Plugins Catalog web UI.
-displayName: Name of your plugin
-
-# For now, `middleware` is the only type available.
-type: middleware
-
-# The import path of your plugin.
-import: github.com/username/my-plugin
-
-# A brief description of what your plugin is doing.
-summary: Description of what my plugin is doing
-
-# Medias associated to the plugin (optional)
-iconPath: foo/icon.png
-bannerPath: foo/banner.png
-
-# Configuration data for your plugin.
-# This is mandatory,
-# and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-testData:
-  Headers:
-    Foo: Bar
+http:
+  middlewares:
+    dev-access:
+      plugin:
+        tailscale-access:
+          tailscaleRanges:
+            - "100.64.0.0/10"
+          additionalRanges:
+            - "127.0.0.1/32"     # Local development
+            - "192.168.1.0/24"   # Office network
+          enableDebugLogging: true  # Helpful during development
+          headersToCheck:
+            - "X-Forwarded-For"
+            - "X-Real-IP"
 ```
 
-Properties include:
+### Scenario 3: Complex Proxy Setup
 
-- `displayName` (required): The name of your plugin as displayed in the Plugins Catalog web UI.
-- `type` (required): For now, `middleware` is the only type available.
-- `import` (required): The import path of your plugin.
-- `summary` (required): A brief description of what your plugin is doing.
-- `testData` (required): Configuration data for your plugin. This is mandatory, and Plugins Catalog will try to execute the plugin with the data you provide as part of its startup validity tests.
-- `iconPath` (optional): A local path in the repository to the icon of the project.
-- `bannerPath` (optional): A local path in the repository to the image that will be used when you will share your plugin page in social medias.
+When you're using multiple layers of proxies (like Gerbil + Traefik), you need to check additional headers where the real IP might be preserved.
 
-There should also be a `go.mod` file at the root of your project. Plugins Catalog will use this file to validate the name of the project.
+```yaml
+http:
+  middlewares:
+    multi-proxy-tailscale:
+      plugin:
+        tailscale-access:
+          tailscaleRanges:
+            - "100.64.0.0/10"
+          headersToCheck:
+            - "X-Forwarded-For"
+            - "X-Real-IP"
+            - "X-Original-Forwarded-For"
+            - "X-Gerbil-Client-IP"  # Custom header from your proxy
+          enableDebugLogging: true
+```
 
-### Tags and Dependencies
+## Integration with Middleware Manager
 
-Plugins Catalog gets your sources from a Go module proxy, so your plugins need to be versioned with a git tag.
+If you're using the Pangolin Middleware Manager, you can add this plugin as a template to make it easily reusable across multiple resources.
 
-Last but not least, if your plugin middleware has Go package dependencies, you need to vendor them and add them to your GitHub repository.
+Add this to your `templates.yaml` file:
 
-If something goes wrong with the integration of your plugin, Plugins Catalog will create an issue inside your Github repository and will stop trying to add your repo until you close the issue.
+```yaml
+middlewares:
+  - id: "tailscale-access"
+    name: "Tailscale Authentication"
+    type: "plugin"
+    config:
+      tailscale-access:
+        tailscaleRanges:
+          - "100.64.0.0/10"
+        additionalRanges:
+          - "127.0.0.1/32"
+        enableDebugLogging: false
+        customErrorMessage: "Access denied: Tailscale connection required"
+        headersToCheck:
+          - "X-Forwarded-For"
+          - "X-Real-IP"
+          - "X-Original-Forwarded-For"
+```
+
+Once this template is loaded, you can apply Tailscale authentication to any resource through the Middleware Manager's web interface, making it as easy as clicking a button to protect your services.
 
 ## Troubleshooting
 
-If Plugins Catalog fails to recognize your plugin, you will need to make one or more changes to your GitHub repository.
+When the plugin isn't working as expected, systematic troubleshooting helps identify where the problem lies in your networking stack.
 
-In order for your plugin to be successfully imported by Plugins Catalog, consult this checklist:
+### Enable Debug Logging First
 
-- The `traefik-plugin` topic must be set on your repository.
-- There must be a `.traefik.yml` file at the root of your project describing your plugin, and it must have a valid `testData` property for testing purposes.
-- There must be a valid `go.mod` file at the root of your project.
-- Your plugin must be versioned with a git tag.
-- If you have package dependencies, they must be vendored and added to your GitHub repository.
+The most effective way to understand what's happening is to enable debug logging temporarily:
+
+```yaml
+enableDebugLogging: true
+```
+
+This will show you exactly what IP addresses the plugin is finding and where it's finding them. Look for log entries like:
+
+```
+[TailscaleAuth:my-middleware] Direct connection IP: 172.17.0.1
+[TailscaleAuth:my-middleware] Checking header X-Forwarded-For: 100.64.1.100, 172.17.0.1
+[TailscaleAuth:my-middleware] Found Tailscale IP in X-Forwarded-For header: 100.64.1.100
+[TailscaleAuth:my-middleware] Allowing access for IP: 100.64.1.100
+```
+
+### Common Issues and Solutions
+
+**Problem**: The plugin is blocking Tailscale clients
+**Solution**: Check if your Tailscale network uses custom IP ranges. Some Tailscale configurations use different subnets, so you might need to add them to `tailscaleRanges`.
+
+**Problem**: Debug logs show the wrong IP being detected
+**Solution**: Examine which headers contain the correct IP and adjust the `headersToCheck` configuration. Different proxy setups use different header names.
+
+**Problem**: Plugin allows non-Tailscale connections
+**Solution**: Verify that your `tailscaleRanges` and `additionalRanges` are configured correctly. Remove any overly broad ranges that might be allowing unwanted traffic.
+
+**Problem**: No debug logs appearing
+**Solution**: Ensure the plugin is actually being applied to your routes. Check that the middleware is correctly referenced in your router configuration.
+
+### Verifying Your Tailscale IP Range
+
+To confirm what IP range your Tailscale network uses, connect a device to Tailscale and check its assigned IP:
+
+```bash
+# On a Tailscale-connected device
+ip addr show tailscale0
+# or
+tailscale ip -4
+```
+
+The IP you see should fall within the ranges configured in your plugin. If it doesn't, you'll need to update your `tailscaleRanges` configuration.
+
+### Local Development Setup
+
+Create a local development environment:
+
+```bash
+# Clone or create your plugin repository
+mkdir tailscale-auth-plugin
+cd tailscale-auth-plugin
+
+# Initialize Go module
+go mod init github.com/yourusername/tailscale-auth-plugin
+
+# Create the basic structure
+touch tailscale-auth.go
+touch tailscale-auth_test.go
+touch .traefik.yml
+```
+
+### Testing Changes
+
+Run the included tests to verify your changes work correctly:
+
+```bash
+go test -v ./...
+```
+
+For testing with Traefik's Yaegi interpreter (which is how plugins actually run):
+
+```bash
+# Install yaegi for testing
+go install github.com/traefik/yaegi/cmd/yaegi@latest
+
+# Test with yaegi
+yaegi test -v .
+```
+
+### Plugin Architecture
+
+Understanding how the plugin works internally helps when making modifications or debugging issues. The plugin follows Traefik's standard middleware pattern, where each HTTP request passes through the `ServeHTTP` method.
+
+The IP detection logic works in layers: first checking the direct connection, then systematically examining HTTP headers for forwarded IP information. This layered approach ensures that the plugin can find Tailscale IPs regardless of how many network hops they've passed through.
+
+The validation logic uses Go's standard `net` package to parse IP addresses and CIDR ranges, ensuring robust and reliable IP matching that handles edge cases correctly.
+
+## Security Considerations
+
+While this plugin significantly improves access control for Tailscale environments, understanding its security implications helps you use it appropriately.
+
+**IP Spoofing**: The plugin relies on IP addresses for authentication, which can potentially be spoofed in certain network configurations. However, when combined with Tailscale's encrypted mesh networking, this provides strong security for most use cases.
+
+**Header Manipulation**: Since the plugin examines HTTP headers to find client IPs, ensure that your proxy configuration doesn't allow external clients to inject or manipulate these headers. Proper proxy configuration should strip untrusted headers from external requests.
+
+**Logging Sensitivity**: Debug logs contain IP address information, which might be considered sensitive in some environments. Ensure that debug logging is disabled in production and that any logs are handled according to your privacy policies.
+
+**Defense in Depth**: This plugin should be part of a broader security strategy rather than the sole security measure. Consider combining it with other authentication methods for highly sensitive resources.
+
+Understanding these considerations helps you deploy the plugin safely while maintaining the security posture your applications require.
