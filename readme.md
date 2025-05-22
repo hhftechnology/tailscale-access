@@ -279,15 +279,15 @@ Create a local development environment:
 
 ```bash
 # Clone or create your plugin repository
-mkdir tailscale-auth-plugin
-cd tailscale-auth-plugin
+mkdir tailscale-access
+cd tailscale-access
 
 # Initialize Go module
-go mod init github.com/yourusername/tailscale-auth-plugin
+go mod init github.com/hhftechnology/tailscale-access
 
 # Create the basic structure
-touch tailscale-auth.go
-touch tailscale-auth_test.go
+touch tailscale-access.go
+touch tailscale-access.go
 touch .traefik.yml
 ```
 

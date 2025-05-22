@@ -2,7 +2,7 @@ displayName: Tailscale Access Only
 type: middleware
 iconPath: .assets/icon.png
 
-import: github.com/yourusername/tailscale-access
+import: github.com/hhftechnology/tailscale-access
 
 summary: 'Allows access only to clients connected via Tailscale'
 
