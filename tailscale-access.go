@@ -1,5 +1,5 @@
 // Package tailscaleauth provides Tailscale-aware IP authentication for Traefik
-package tailscaleauth
+package tailscale_access
 
 import (
 	"context"

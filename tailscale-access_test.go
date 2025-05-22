@@ -1,4 +1,4 @@
-package tailscaleauth_test
+package tailscale_access_test
 
 import (
 	"context"
