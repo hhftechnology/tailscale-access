@@ -1,384 +1,756 @@
-// Enhanced version that detects Tailscale connections more intelligently
+// Tailscale Authentication Plugin - Connectivity Based Verification
 package tailscale_access
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"log"
-	"net"
 	"net/http"
 	"strings"
+	"time"
 )
-
-const (
-	DefaultTailscaleCIDR = "100.64.0.0/10"
-	DefaultErrorMessage  = "Access denied: Tailscale connection required"
-)
-
-var DefaultHeadersToCheck = []string{
-	"X-Forwarded-For",
-	"X-Real-IP",
-	"X-Original-Forwarded-For",
-	"CF-Connecting-IP",
-	"True-Client-IP",
-	"X-Client-IP",
-	"Tailscale-User",      // Tailscale sets this header
-	"Tailscale-Login",     // Additional Tailscale header
-}
 
 type Config struct {
-	TailscaleRanges    []string `json:"tailscaleRanges,omitempty"`
-	AdditionalRanges   []string `json:"additionalRanges,omitempty"`
-	HeadersToCheck     []string `json:"headersToCheck,omitempty"`
-	EnableDebugLogging bool     `json:"enableDebugLogging,omitempty"`
-	CustomErrorMessage string   `json:"customErrorMessage,omitempty"`
-	StrictMode         bool     `json:"strictMode,omitempty"`
-	TrustedProxies     []string `json:"trustedProxies,omitempty"`
+	// Tailscale domain to test connectivity against
+	TestDomain string `json:"testDomain,omitempty"`
 	
-	// New: Detect Tailscale by interface/route
-	AutoDetectTailscale bool   `json:"autoDetectTailscale,omitempty"`
+	// Custom verification endpoint (optional)
+	VerificationEndpoint string `json:"verificationEndpoint,omitempty"`
 	
-	// New: Allow bypass for localhost development
-	AllowLocalhost     bool   `json:"allowLocalhost,omitempty"`
+	// Session timeout for verified connections
+	SessionTimeout time.Duration `json:"sessionTimeout,omitempty"`
 	
-	// New: Show helpful error with Tailscale connection instructions
-	ShowTailscaleHelp  bool   `json:"showTailscaleHelp,omitempty"`
+	// Custom error messages
+	CustomErrorMessage string `json:"customErrorMessage,omitempty"`
+	SuccessMessage     string `json:"successMessage,omitempty"`
+	
+	// Enable debug logging
+	EnableDebugLogging bool `json:"enableDebugLogging,omitempty"`
+	
+	// Bypass for development
+	AllowLocalhost bool `json:"allowLocalhost,omitempty"`
+	
+	// Custom styling
+	CustomCSS    string `json:"customCSS,omitempty"`
+	CustomScript string `json:"customScript,omitempty"`
+	
+	// Security settings
+	SecureOnly        bool   `json:"secureOnly,omitempty"`
+	CookieDomain      string `json:"cookieDomain,omitempty"`
+	RequireUserAgent  bool   `json:"requireUserAgent,omitempty"`
 }
 
 func CreateConfig() *Config {
 	return &Config{
-		TailscaleRanges:     []string{DefaultTailscaleCIDR},
-		HeadersToCheck:      DefaultHeadersToCheck,
-		EnableDebugLogging:  false,
-		CustomErrorMessage:  DefaultErrorMessage,
-		AdditionalRanges:    []string{},
-		StrictMode:          true,
-		TrustedProxies:      []string{},
-		AutoDetectTailscale: true,  // New default
-		AllowLocalhost:      true,  // Allow localhost for development
-		ShowTailscaleHelp:   true,  // Show helpful error messages
+		TestDomain:         "your-tailscale-network.ts.net", // User should configure this
+		SessionTimeout:     24 * time.Hour,
+		CustomErrorMessage: "Tailscale connection required to access this service",
+		SuccessMessage:     "Tailscale connectivity verified! Redirecting...",
+		EnableDebugLogging: false,
+		AllowLocalhost:     true,
+		SecureOnly:         true,
+		RequireUserAgent:   true,
 	}
 }
 
-type TailscaleAuth struct {
-	next                 http.Handler
-	name                 string
-	config               *Config
-	parsedTailscaleNets  []*net.IPNet
-	parsedAdditionalNets []*net.IPNet
-	parsedTrustedProxies []*net.IPNet
-	localTailscaleIP     net.IP // Detected local Tailscale IP
+type TailscaleConnectivityAuth struct {
+	next    http.Handler
+	name    string
+	config  *Config
+	secrets map[string]time.Time // Simple in-memory session store
 }
 
 func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	// Apply defaults
-	if len(config.TailscaleRanges) == 0 {
-		config.TailscaleRanges = []string{DefaultTailscaleCIDR}
+	if config.TestDomain == "" {
+		return nil, fmt.Errorf("testDomain must be configured")
 	}
-	if len(config.HeadersToCheck) == 0 {
-		config.HeadersToCheck = DefaultHeadersToCheck
+	if config.SessionTimeout == 0 {
+		config.SessionTimeout = 24 * time.Hour
 	}
 	if config.CustomErrorMessage == "" {
-		config.CustomErrorMessage = DefaultErrorMessage
+		config.CustomErrorMessage = "Tailscale connection required to access this service"
+	}
+	if config.SuccessMessage == "" {
+		config.SuccessMessage = "Tailscale connectivity verified! Redirecting..."
 	}
 
-	// Parse CIDR ranges
-	parsedTailscaleNets, err := parseCIDRs(config.TailscaleRanges)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse tailscaleRanges: %w", err)
-	}
-
-	parsedAdditionalNets, err := parseCIDRs(config.AdditionalRanges)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse additionalRanges: %w", err)
-	}
-
-	parsedTrustedProxies, err := parseCIDRs(config.TrustedProxies)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse trustedProxies: %w", err)
-	}
-
-	// Auto-detect local Tailscale IP
-	var localTailscaleIP net.IP
-	if config.AutoDetectTailscale {
-		localTailscaleIP = detectLocalTailscaleIP(parsedTailscaleNets)
-		if localTailscaleIP != nil && config.EnableDebugLogging {
-			log.Printf("[INFO] TailscaleAuth '%s': Detected local Tailscale IP: %s", name, localTailscaleIP.String())
-		}
-	}
-
-	if len(parsedTailscaleNets) == 0 && len(parsedAdditionalNets) == 0 {
-		return nil, fmt.Errorf("tailscale-auth plugin misconfiguration: at least one valid TailscaleRange or AdditionalRange must be provided")
-	}
-
-	if config.EnableDebugLogging {
-		log.Printf("[INFO] TailscaleAuth plugin '%s' initialized. Tailscale Ranges: %v, Additional Ranges: %v, LocalTailscaleIP: %v", 
-			name, config.TailscaleRanges, config.AdditionalRanges, localTailscaleIP)
-	}
-
-	return &TailscaleAuth{
-		next:                 next,
-		name:                 name,
-		config:               config,
-		parsedTailscaleNets:  parsedTailscaleNets,
-		parsedAdditionalNets: parsedAdditionalNets,
-		parsedTrustedProxies: parsedTrustedProxies,
-		localTailscaleIP:     localTailscaleIP,
+	return &TailscaleConnectivityAuth{
+		next:    next,
+		name:    name,
+		config:  config,
+		secrets: make(map[string]time.Time),
 	}, nil
 }
 
-// detectLocalTailscaleIP tries to find the local Tailscale IP
-func detectLocalTailscaleIP(tailscaleNets []*net.IPNet) net.IP {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-
-	for _, iface := range interfaces {
-		// Skip non-Tailscale interfaces
-		if !strings.Contains(strings.ToLower(iface.Name), "tailscale") && 
-		   !strings.Contains(strings.ToLower(iface.Name), "utun") &&
-		   !strings.Contains(strings.ToLower(iface.Name), "tun") {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok {
-				ip := ipnet.IP
-				// Check if this IP is in Tailscale range
-				for _, tailscaleNet := range tailscaleNets {
-					if tailscaleNet.Contains(ip) {
-						return ip
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func parseCIDRs(cidrStrings []string) ([]*net.IPNet, error) {
-	parsedNets := make([]*net.IPNet, 0, len(cidrStrings))
-	for _, cidrStr := range cidrStrings {
-		if cidrStr == "" {
-			continue
-		}
-		_, ipNet, err := net.ParseCIDR(cidrStr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR string %q: %w", cidrStr, err)
-		}
-		parsedNets = append(parsedNets, ipNet)
-	}
-	return parsedNets, nil
-}
-
-func (t *TailscaleAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	clientIP, source := t.extractClientIP(req)
-	if clientIP == nil {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': No valid client IP found for request to %s", t.name, req.URL.Path)
-		}
-		t.denyAccess(rw, req)
-		return
-	}
-
-	if t.config.EnableDebugLogging {
-		log.Printf("[DEBUG] TailscaleAuth '%s': Checking IP %s (from %s) for request to %s", t.name, clientIP.String(), source, req.URL.Path)
-	}
-
-	if t.isIPAllowed(clientIP) {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Allowing access for IP %s (from %s)", t.name, clientIP.String(), source)
-		}
+func (t *TailscaleConnectivityAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Check for localhost bypass
+	if t.config.AllowLocalhost && t.isLocalhost(req) {
 		t.next.ServeHTTP(rw, req)
 		return
 	}
 
-	if t.config.EnableDebugLogging {
-		log.Printf("[DEBUG] TailscaleAuth '%s': Blocking access for IP %s (from %s)", t.name, clientIP.String(), source)
+	// Handle verification callback
+	if req.URL.Path == "/__tailscale_verify" {
+		t.handleVerification(rw, req)
+		return
 	}
-	t.denyAccess(rw, req)
+
+	// Check if already verified
+	if t.isVerified(req) {
+		t.next.ServeHTTP(rw, req)
+		return
+	}
+
+	// Show verification page
+	t.serveVerificationPage(rw, req)
 }
 
-func (t *TailscaleAuth) extractClientIP(req *http.Request) (net.IP, string) {
-	// Check for Tailscale-specific headers first
-	if tailscaleUser := req.Header.Get("Tailscale-User"); tailscaleUser != "" {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Found Tailscale-User header: %s", t.name, tailscaleUser)
-		}
-		// If we have Tailscale headers, trust that this is a Tailscale connection
-		// and use the local Tailscale IP
-		if t.localTailscaleIP != nil {
-			return t.localTailscaleIP, "Tailscale-User header (local TS IP)"
-		}
+func (t *TailscaleConnectivityAuth) isLocalhost(req *http.Request) bool {
+	host := req.Host
+	if strings.Contains(host, ":") {
+		host = strings.Split(host, ":")[0]
 	}
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
 
-	// Get direct connection IP
-	directIP, _, err := net.SplitHostPort(req.RemoteAddr)
+func (t *TailscaleConnectivityAuth) isVerified(req *http.Request) bool {
+	cookie, err := req.Cookie("tailscale_verified")
 	if err != nil {
-		directIP = strings.TrimSpace(req.RemoteAddr)
-	}
-	directIPParsed := net.ParseIP(strings.TrimSpace(directIP))
-
-	// Check if we should trust headers from this direct connection
-	trustHeaders := len(t.parsedTrustedProxies) == 0 || 
-		(directIPParsed != nil && t.isIPInSpecificNets(directIPParsed, t.parsedTrustedProxies))
-
-	if !trustHeaders {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Direct IP %s is not in trusted proxies, ignoring headers", t.name, directIP)
-		}
-		return directIPParsed, "RemoteAddr (untrusted proxy)"
-	}
-
-	// Check headers for forwarded IPs
-	for _, headerName := range t.config.HeadersToCheck {
-		headerValue := req.Header.Get(headerName)
-		if headerValue == "" {
-			continue
-		}
-
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Checking header %s: %s", t.name, headerName, headerValue)
-		}
-
-		ips := strings.Split(headerValue, ",")
-		for i, ipStr := range ips {
-			trimmedIP := strings.TrimSpace(ipStr)
-			parsedIP := net.ParseIP(trimmedIP)
-			if parsedIP == nil {
-				continue
-			}
-
-			if t.config.StrictMode {
-				if t.isIPInSpecificNets(parsedIP, t.parsedTailscaleNets) {
-					if t.config.EnableDebugLogging {
-						log.Printf("[DEBUG] TailscaleAuth '%s': Found Tailscale IP %s in header %s (position %d)", t.name, trimmedIP, headerName, i)
-					}
-					return parsedIP, fmt.Sprintf("header %s (strict mode)", headerName)
-				}
-				continue
-			}
-
-			if t.config.EnableDebugLogging {
-				log.Printf("[DEBUG] TailscaleAuth '%s': Using IP %s from header %s (position %d, non-strict mode)", t.name, trimmedIP, headerName, i)
-			}
-			return parsedIP, fmt.Sprintf("header %s (non-strict mode)", headerName)
-		}
-	}
-
-	// Fallback to direct connection IP
-	if directIPParsed != nil {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Using direct connection IP %s", t.name, directIP)
-		}
-		return directIPParsed, "RemoteAddr (fallback)"
-	}
-
-	return nil, "none found"
-}
-
-func (t *TailscaleAuth) isIPAllowed(ip net.IP) bool {
-	if ip == nil {
 		return false
 	}
 
-	// Special case: allow localhost if configured
-	if t.config.AllowLocalhost && ip.IsLoopback() {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': Allowing localhost IP %s", t.name, ip.String())
-		}
-		return true
-	}
-
-	// Check against Tailscale ranges first
-	if t.isIPInSpecificNets(ip, t.parsedTailscaleNets) {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': IP %s matches Tailscale range", t.name, ip.String())
-		}
-		return true
-	}
-
-	// Check against additional allowed ranges
-	if t.isIPInSpecificNets(ip, t.parsedAdditionalNets) {
-		if t.config.EnableDebugLogging {
-			log.Printf("[DEBUG] TailscaleAuth '%s': IP %s matches additional range", t.name, ip.String())
-		}
-		return true
-	}
-
-	return false
-}
-
-func (t *TailscaleAuth) isIPInSpecificNets(ip net.IP, networks []*net.IPNet) bool {
-	if ip == nil {
+	// Check if token exists and is not expired
+	expiry, exists := t.secrets[cookie.Value]
+	if !exists || time.Now().After(expiry) {
+		// Clean up expired token
+		delete(t.secrets, cookie.Value)
 		return false
 	}
-	for _, network := range networks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-	return false
+
+	return true
 }
 
-func (t *TailscaleAuth) denyAccess(rw http.ResponseWriter, req *http.Request) {
-	rw.Header().Set("Content-Type", "text/html")
+func (t *TailscaleConnectivityAuth) handleVerification(rw http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form data
+	if err := req.ParseForm(); err != nil {
+		http.Error(rw, "Invalid form data", http.StatusBadRequest)
+		return
+	}
+
+	status := req.FormValue("status")
+	originalURL := req.FormValue("originalURL")
+
+	if status == "success" {
+		// Generate verification token
+		token := t.generateToken()
+		expiry := time.Now().Add(t.config.SessionTimeout)
+		t.secrets[token] = expiry
+
+		// Set secure cookie
+		cookie := &http.Cookie{
+			Name:     "tailscale_verified",
+			Value:    token,
+			Expires:  expiry,
+			HttpOnly: true,
+			Secure:   t.config.SecureOnly,
+			SameSite: http.SameSiteLaxMode,
+			Path:     "/",
+		}
+		if t.config.CookieDomain != "" {
+			cookie.Domain = t.config.CookieDomain
+		}
+		http.SetCookie(rw, cookie)
+
+		// Return success response
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusOK)
+		response := fmt.Sprintf(`{"success": true, "message": "%s", "redirectURL": "%s"}`, 
+			t.config.SuccessMessage, originalURL)
+		rw.Write([]byte(response))
+		return
+	}
+
+	// Verification failed
+	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusForbidden)
-	
-	if t.config.ShowTailscaleHelp {
-		helpMessage := t.generateHelpMessage(req)
-		_, err := rw.Write([]byte(helpMessage))
-		if err != nil && t.config.EnableDebugLogging {
-			log.Printf("[ERROR] TailscaleAuth '%s': Failed to write response body: %v", t.name, err)
-		}
-	} else {
-		_, err := rw.Write([]byte(t.config.CustomErrorMessage))
-		if err != nil && t.config.EnableDebugLogging {
-			log.Printf("[ERROR] TailscaleAuth '%s': Failed to write response body: %v", t.name, err)
-		}
-	}
+	response := fmt.Sprintf(`{"success": false, "message": "%s"}`, t.config.CustomErrorMessage)
+	rw.Write([]byte(response))
 }
 
-func (t *TailscaleAuth) generateHelpMessage(req *http.Request) string {
+func (t *TailscaleConnectivityAuth) generateToken() string {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	hash := sha256.Sum256(bytes)
+	return hex.EncodeToString(hash[:])
+}
+
+func (t *TailscaleConnectivityAuth) serveVerificationPage(rw http.ResponseWriter, req *http.Request) {
+	// Get the original URL for redirect after verification
+	originalURL := req.URL.String()
+	if req.URL.RawQuery != "" {
+		originalURL = req.URL.Path + "?" + req.URL.RawQuery
+	} else {
+		originalURL = req.URL.Path
+	}
+
+	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+	rw.WriteHeader(http.StatusOK)
+
+	html := t.generateVerificationHTML(originalURL)
+	rw.Write([]byte(html))
+}
+
+func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string) string {
+	customCSS := t.config.CustomCSS
+	if customCSS == "" {
+		customCSS = t.getDefaultCSS()
+	}
+
+	customScript := t.config.CustomScript
+	if customScript == "" {
+		customScript = ""
+	}
+
 	return fmt.Sprintf(`<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Tailscale Connection Required</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
-        .error { background: #f8d7da; border: 1px solid #f5c6cb; padding: 15px; border-radius: 5px; }
-        .help { background: #d1ecf1; border: 1px solid #bee5eb; padding: 15px; border-radius: 5px; margin-top: 20px; }
-        code { background: #f8f9fa; padding: 2px 5px; border-radius: 3px; }
-    </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tailscale Verification Required</title>
+    <style>%s</style>
 </head>
 <body>
-    <div class="error">
-        <h2>🔒 Access Denied</h2>
-        <p>This service requires a Tailscale connection.</p>
+    <div class="container">
+        <div class="verification-card">
+            <div class="header">
+                <div class="tailscale-logo">
+                    <svg width="40" height="40" viewBox="0 0 100 100" fill="none">
+                        <circle cx="50" cy="50" r="45" fill="#000"/>
+                        <path d="M25 35h50v30H25z" fill="#fff"/>
+                        <circle cx="35" cy="50" r="5" fill="#000"/>
+                        <circle cx="65" cy="50" r="5" fill="#000"/>
+                    </svg>
+                </div>
+                <h1>Tailscale Verification</h1>
+                <p>Verifying your Tailscale connection...</p>
+            </div>
+
+            <div class="status-container">
+                <div id="checking" class="status-item active">
+                    <div class="spinner"></div>
+                    <span>Testing Tailscale connectivity...</span>
+                </div>
+                
+                <div id="success" class="status-item success hidden">
+                    <div class="check-icon">✓</div>
+                    <span>Tailscale connection verified!</span>
+                </div>
+                
+                <div id="error" class="status-item error hidden">
+                    <div class="error-icon">✗</div>
+                    <span>Tailscale connection not detected</span>
+                </div>
+            </div>
+
+            <div id="error-details" class="error-details hidden">
+                <h3>How to connect via Tailscale:</h3>
+                <ol>
+                    <li><strong>Install Tailscale</strong> from <a href="https://tailscale.com/download" target="_blank">tailscale.com/download</a></li>
+                    <li><strong>Connect to your network</strong> and ensure you can access <code>%s</code></li>
+                    <li><strong>Refresh this page</strong> to try again</li>
+                </ol>
+                
+                <div class="technical-details">
+                    <details>
+                        <summary>Technical Details</summary>
+                        <p>This service requires access through a Tailscale network. We test connectivity by attempting to reach your Tailscale domain.</p>
+                        <p><strong>Test Domain:</strong> <code>%s</code></p>
+                        <p><strong>Error:</strong> <span id="error-message">Connection failed</span></p>
+                    </details>
+                </div>
+                
+                <button onclick="retryVerification()" class="retry-button">
+                    <span class="retry-icon">↻</span>
+                    Try Again
+                </button>
+            </div>
+
+            <div id="success-details" class="success-details hidden">
+                <p>%s</p>
+                <div class="progress-bar">
+                    <div class="progress-fill"></div>
+                </div>
+                <p class="redirect-text">Redirecting in <span id="countdown">3</span> seconds...</p>
+            </div>
+        </div>
     </div>
-    
-    <div class="help">
-        <h3>How to access this service:</h3>
-        <ol>
-            <li><strong>Install Tailscale:</strong> Visit <a href="https://tailscale.com/download">tailscale.com/download</a></li>
-            <li><strong>Connect to your network:</strong> Join the Tailscale network</li>
-            <li><strong>Refresh this page</strong></li>
-        </ol>
-        
-        <p><strong>Service:</strong> %s</p>
-        <p><strong>Your IP:</strong> Not from Tailscale network</p>
-        
-        <details>
-            <summary>Technical Details</summary>
-            <p>This service is protected by Tailscale network access control. Only devices connected to the Tailscale network can access this resource.</p>
-        </details>
-    </div>
+
+    <script>
+        let verificationAttempts = 0;
+        const maxAttempts = 3;
+        const testDomain = '%s';
+        const originalURL = '%s';
+
+        %s
+
+        async function verifyTailscaleConnectivity() {
+            verificationAttempts++;
+            
+            try {
+                // Test 1: Try to fetch from the Tailscale domain
+                const testUrl = 'https://' + testDomain + '/';
+                
+                // Use fetch with a timeout
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
+                
+                const response = await fetch(testUrl, {
+                    method: 'GET',
+                    mode: 'no-cors', // This allows the request even if CORS fails
+                    cache: 'no-cache',
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                // If we get here, the domain is reachable
+                await reportVerificationResult(true, 'Tailscale domain reachable');
+                
+            } catch (error) {
+                console.log('Primary test failed:', error.message);
+                
+                // Test 2: Try alternative method - image loading
+                try {
+                    await testImageLoad();
+                    await reportVerificationResult(true, 'Tailscale connectivity confirmed via image test');
+                } catch (imgError) {
+                    console.log('Image test failed:', imgError.message);
+                    
+                    // Test 3: Try WebSocket if available
+                    try {
+                        await testWebSocket();
+                        await reportVerificationResult(true, 'Tailscale connectivity confirmed via WebSocket');
+                    } catch (wsError) {
+                        console.log('WebSocket test failed:', wsError.message);
+                        await reportVerificationResult(false, error.message + ' (all tests failed)');
+                    }
+                }
+            }
+        }
+
+        function testImageLoad() {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                const timeout = setTimeout(() => {
+                    reject(new Error('Image load timeout'));
+                }, 5000);
+                
+                img.onload = () => {
+                    clearTimeout(timeout);
+                    resolve();
+                };
+                
+                img.onerror = () => {
+                    clearTimeout(timeout);
+                    reject(new Error('Image load failed'));
+                };
+                
+                // Try to load a favicon or small image from the Tailscale domain
+                img.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
+            });
+        }
+
+        function testWebSocket() {
+            return new Promise((resolve, reject) => {
+                try {
+                    const ws = new WebSocket('wss://' + testDomain + '/ws');
+                    const timeout = setTimeout(() => {
+                        ws.close();
+                        reject(new Error('WebSocket timeout'));
+                    }, 3000);
+                    
+                    ws.onopen = () => {
+                        clearTimeout(timeout);
+                        ws.close();
+                        resolve();
+                    };
+                    
+                    ws.onerror = () => {
+                        clearTimeout(timeout);
+                        reject(new Error('WebSocket connection failed'));
+                    };
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        }
+
+        async function reportVerificationResult(success, message) {
+            const formData = new FormData();
+            formData.append('status', success ? 'success' : 'failure');
+            formData.append('originalURL', originalURL);
+            formData.append('message', message);
+
+            try {
+                const response = await fetch('/__tailscale_verify', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (success && result.success) {
+                    showSuccess();
+                    setTimeout(() => {
+                        window.location.href = originalURL;
+                    }, 3000);
+                } else {
+                    showError(message);
+                }
+            } catch (error) {
+                console.error('Failed to report verification result:', error);
+                showError('Verification reporting failed: ' + error.message);
+            }
+        }
+
+        function showSuccess() {
+            document.getElementById('checking').classList.remove('active');
+            document.getElementById('checking').classList.add('hidden');
+            document.getElementById('success').classList.remove('hidden');
+            document.getElementById('success').classList.add('active');
+            document.getElementById('success-details').classList.remove('hidden');
+            
+            // Start countdown
+            let countdown = 3;
+            const countdownElement = document.getElementById('countdown');
+            const countdownTimer = setInterval(() => {
+                countdown--;
+                countdownElement.textContent = countdown;
+                if (countdown <= 0) {
+                    clearInterval(countdownTimer);
+                }
+            }, 1000);
+        }
+
+        function showError(message) {
+            document.getElementById('checking').classList.remove('active');
+            document.getElementById('checking').classList.add('hidden');
+            document.getElementById('error').classList.remove('hidden');
+            document.getElementById('error').classList.add('active');
+            document.getElementById('error-details').classList.remove('hidden');
+            document.getElementById('error-message').textContent = message;
+        }
+
+        function retryVerification() {
+            if (verificationAttempts >= maxAttempts) {
+                alert('Maximum verification attempts reached. Please check your Tailscale connection and refresh the page.');
+                return;
+            }
+            
+            // Reset UI
+            document.getElementById('error').classList.add('hidden');
+            document.getElementById('error').classList.remove('active');
+            document.getElementById('error-details').classList.add('hidden');
+            document.getElementById('checking').classList.remove('hidden');
+            document.getElementById('checking').classList.add('active');
+            
+            // Retry verification
+            setTimeout(verifyTailscaleConnectivity, 1000);
+        }
+
+        // Start verification when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            setTimeout(verifyTailscaleConnectivity, 1000);
+        });
+    </script>
 </body>
-</html>`, req.Host)
+</html>`, 
+		customCSS,
+		t.config.TestDomain,
+		t.config.TestDomain,
+		t.config.SuccessMessage,
+		t.config.TestDomain,
+		originalURL,
+		customScript,
+	)
+}
+
+func (t *TailscaleConnectivityAuth) getDefaultCSS() string {
+	return `
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 500px;
+            width: 100%;
+        }
+
+        .verification-card {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            padding: 40px;
+            text-align: center;
+            animation: slideUp 0.6s ease-out;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .header h1 {
+            color: #333;
+            margin: 20px 0 10px;
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .header p {
+            color: #666;
+            font-size: 16px;
+            margin-bottom: 30px;
+        }
+
+        .tailscale-logo {
+            display: inline-block;
+            margin-bottom: 10px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+
+        .status-container {
+            margin: 30px 0;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            border-radius: 12px;
+            margin: 15px 0;
+            font-size: 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .status-item.active {
+            background: #f0f9ff;
+            border: 2px solid #3b82f6;
+            color: #1e40af;
+        }
+
+        .status-item.success {
+            background: #ecfdf5;
+            border: 2px solid #10b981;
+            color: #047857;
+        }
+
+        .status-item.error {
+            background: #fef2f2;
+            border: 2px solid #ef4444;
+            color: #dc2626;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #3b82f6;
+            border-top: 2px solid transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 12px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .check-icon, .error-icon {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-weight: bold;
+            font-size: 16px;
+        }
+
+        .check-icon {
+            background: #10b981;
+            color: white;
+        }
+
+        .error-icon {
+            background: #ef4444;
+            color: white;
+        }
+
+        .error-details, .success-details {
+            text-align: left;
+            background: #f9fafb;
+            border-radius: 12px;
+            padding: 25px;
+            margin-top: 20px;
+        }
+
+        .error-details h3 {
+            color: #374151;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        .error-details ol {
+            margin: 15px 0;
+            padding-left: 20px;
+        }
+
+        .error-details li {
+            margin: 8px 0;
+            color: #4b5563;
+            line-height: 1.5;
+        }
+
+        .technical-details {
+            margin-top: 20px;
+            border-top: 1px solid #e5e7eb;
+            padding-top: 20px;
+        }
+
+        .technical-details summary {
+            cursor: pointer;
+            font-weight: 500;
+            color: #374151;
+            padding: 5px 0;
+        }
+
+        .technical-details p {
+            margin: 10px 0;
+            color: #6b7280;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        code {
+            background: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 13px;
+            color: #374151;
+        }
+
+        .retry-button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 20px auto 0;
+            transition: background 0.2s;
+        }
+
+        .retry-button:hover {
+            background: #2563eb;
+        }
+
+        .retry-icon {
+            margin-right: 8px;
+            font-size: 16px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #e5e7eb;
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #34d399);
+            animation: progress 3s linear;
+        }
+
+        @keyframes progress {
+            from { width: 0%; }
+            to { width: 100%; }
+        }
+
+        .redirect-text {
+            color: #6b7280;
+            font-size: 14px;
+            margin-top: 10px;
+        }
+
+        a {
+            color: #3b82f6;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 480px) {
+            .verification-card {
+                padding: 30px 20px;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+            
+            .status-item {
+                padding: 15px;
+                font-size: 14px;
+            }
+        }
+    `
 }

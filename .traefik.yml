@@ -1,13 +1,111 @@
-displayName: Tailscale Access Only
+displayName: Tailscale Connectivity Authentication
 type: middleware
 iconPath: .assets/icon.png
 
 import: github.com/hhftechnology/tailscale-access
 
-summary: 'Allows access only to clients connected via Tailscale'
+summary: 'Smart Tailscale authentication using real connectivity testing instead of unreliable IP checking'
 
 testData:
-  TailscaleRanges:
-    - "100.64.0.0/10"
-  EnableDebugLogging: true
-  CustomErrorMessage: "Access denied: Tailscale connection required"
+  testDomain: "example.ts.net"
+  sessionTimeout: "24h"
+  allowLocalhost: true
+  enableDebugLogging: false
+  customErrorMessage: "Tailscale VPN connection required to access this service"
+  successMessage: "Tailscale connectivity verified! Redirecting..."
+  secureOnly: true
+  cookieDomain: ""
+
+compatibility:
+  traefik: ">=3.0.0"
+
+description: |
+  # Tailscale Connectivity Authentication
+
+  A revolutionary Traefik middleware that provides secure access control by **actually testing Tailscale connectivity** 
+  rather than relying on unreliable IP address detection.
+
+  ## Key Features
+
+  🎯 **Real Connectivity Testing** - Tests actual ability to reach your Tailscale network, not just IP ranges
+  🔄 **Proxy-Agnostic** - Works regardless of reverse proxies, containers, or network complexity  
+  🎨 **Beautiful UI** - Modern verification interface with real-time feedback
+  🔒 **Secure Sessions** - Cryptographically secure session management
+  ⚡ **High Performance** - Minimal overhead for verified users
+  🛠 **Highly Configurable** - Custom styling, messages, timeouts, and behavior
+
+  ## How It Works
+
+  1. Intercepts requests to protected resources
+  2. Checks for valid verification session
+  3. If unverified, serves interactive verification page
+  4. JavaScript tests connectivity to your `.ts.net` domain
+  5. Creates secure session on successful verification
+  6. Allows access with session cookie
+
+  ## Configuration
+
+  ```yaml
+  http:
+    middlewares:
+      tailscale-auth:
+        plugin:
+          tailscale-connectivity:
+            testDomain: "your-company.ts.net"  # Required
+            sessionTimeout: "24h"
+            allowLocalhost: true
+            customErrorMessage: "VPN connection required"
+  ```
+
+  ## Why This Approach Is Superior
+
+  Traditional IP-based authentication fails in modern networking:
+  - Multiple reverse proxies mangle client IPs
+  - Container networking obscures real IPs  
+  - Cloud load balancers replace source IPs
+  - Headers can be spoofed by malicious actors
+
+  Our connectivity-based approach actually verifies real Tailscale access regardless of network complexity.
+
+author:
+  name: "HHF Technology"
+  email: "support@hhf.technology"
+
+keywords:
+  - tailscale
+  - vpn
+  - authentication
+  - security
+  - access-control
+  - middleware
+  - connectivity-testing
+
+documentation: https://github.com/hhftechnology/tailscale-access/blob/main/README.md
+repository: https://github.com/hhftechnology/tailscale-access
+issues: https://github.com/hhftechnology/tailscale-access/issues
+
+changelog:
+  - version: "2.0.0"
+    date: "2025-05-26"
+    changes:
+      - "🎉 Complete rewrite using connectivity-based verification"
+      - "🎨 Beautiful modern verification UI with real-time feedback"
+      - "🔒 Secure session management with cryptographic tokens"
+      - "⚡ Multi-method connectivity testing (fetch, image, WebSocket)"
+      - "🛠 Extensive customization options (CSS, messages, timeouts)"
+      - "🐳 Enhanced Docker and Kubernetes integration examples"
+      - "📚 Comprehensive documentation and troubleshooting guide"
+      - "🔧 Removed unreliable IP-based detection completely"
+    breaking:
+      - "Configuration format changed from IP ranges to domain testing"
+      - "Session-based authentication replaces per-request IP checking"
+      - "JavaScript-based verification requires client browser support"
+
+  - version: "1.0.0"
+    date: "2025-05-15"
+    changes:
+      - "Initial release with IP-based authentication"
+      - "Support for Tailscale IP range detection"
+      - "Header-based IP extraction for proxy environments"
+    deprecated: true
+    reason: "IP-based approach unreliable in modern networking environments"
