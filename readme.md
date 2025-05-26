@@ -1,4 +1,26 @@
-# Tailscale Connectivity Authentication Plugin for Traefik
+# 
+<div align="center" width="100%">
+    <h1> Tailscale Connectivity Authentication Plugin for Traefik v3</h1>
+    <img width="auto" src=".assets/banner.png">
+    <a target="_blank" href="https://GitHub.com/hhftechnology/tailscale-access/graphs/contributors/"><img src="https://img.shields.io/github/contributors/hhftechnology/tailscale-access.svg" /></a><br>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/tailscale-access/commits/"><img src="https://img.shields.io/github/last-commit/hhftechnology/tailscale-access.svg" /></a>
+    <a target="_blank" href="https://GitHub.com/hhftechnology/tailscale-access/issues/"><img src="https://img.shields.io/github/issues/hhftechnology/tailscale-access.svg" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/tailscale-access/issues?q=is%3Aissue+is%3Aclosed"><img src="https://img.shields.io/github/issues-closed/hhftechnology/tailscale-access.svg" /></a><br>
+        <a target="_blank" href="https://github.com/hhftechnology/tailscale-access/stargazers"><img src="https://img.shields.io/github/stars/hhftechnology/tailscale-access.svg?style=social&label=Star" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/tailscale-access/network/members"><img src="https://img.shields.io/github/forks/hhftechnology/tailscale-access.svg?style=social&label=Fork" /></a>
+    <a target="_blank" href="https://github.com/hhftechnology/tailscale-access/watchers"><img src="https://img.shields.io/github/watchers/hhftechnology/tailscale-access.svg?style=social&label=Watch" /></a><br>
+</div>
+
+<div align="center" width="100%">
+    <p>This is a plugin for [Traefik](https://traefik.io) to build a **feature-rich static file server** as a middleware.</p>
+    <a target="_blank" href="https://github.com/hhftechnology/tailscale-access"><img src="https://img.shields.io/badge/maintainer-hhftechnology-orange" /></a>
+</div>
+
+## 📝 Forums
+
+[See the forums for further discussion here](https://forum.hhf.technology/)
+Make Traefik a powerful and secure rp!
+
 
 A Traefik middleware plugin that provides secure access control by **actually testing Tailscale connectivity** rather than relying on unreliable IP address checking. This plugin solves the complex challenge of verifying real Tailscale connections in modern networking environments with a simple, efficient, client-side approach.
 
