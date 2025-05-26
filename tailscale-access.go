@@ -19,8 +19,11 @@ type Config struct {
 	// Custom verification endpoint (optional)
 	VerificationEndpoint string `json:"verificationEndpoint,omitempty"`
 	
-	// Session timeout for verified connections
-	SessionTimeout time.Duration `json:"sessionTimeout,omitempty"`
+	// Session timeout for verified connections (in seconds)
+	SessionTimeoutSeconds int `json:"sessionTimeoutSeconds,omitempty"`
+	
+	// Session timeout as duration string (e.g., "24h", "30m") - will be converted to seconds
+	SessionTimeout string `json:"sessionTimeout,omitempty"`
 	
 	// Custom error messages
 	CustomErrorMessage string `json:"customErrorMessage,omitempty"`
@@ -44,32 +47,51 @@ type Config struct {
 
 func CreateConfig() *Config {
 	return &Config{
-		TestDomain:         "your-tailscale-network.ts.net", // User should configure this
-		SessionTimeout:     24 * time.Hour,
-		CustomErrorMessage: "Tailscale connection required to access this service",
-		SuccessMessage:     "Tailscale connectivity verified! Redirecting...",
-		EnableDebugLogging: false,
-		AllowLocalhost:     true,
-		SecureOnly:         true,
-		RequireUserAgent:   true,
+		TestDomain:            "your-tailscale-network.ts.net", // User should configure this
+		SessionTimeout:        "24h",
+		SessionTimeoutSeconds: 86400, // 24 hours in seconds as fallback
+		CustomErrorMessage:    "Tailscale connection required to access this service",
+		SuccessMessage:        "Tailscale connectivity verified! Redirecting...",
+		EnableDebugLogging:    false,
+		AllowLocalhost:        true,
+		SecureOnly:            true,
+		RequireUserAgent:      true,
 	}
 }
 
 type TailscaleConnectivityAuth struct {
-	next    http.Handler
-	name    string
-	config  *Config
-	secrets map[string]time.Time // Simple in-memory session store
+	next            http.Handler
+	name            string
+	config          *Config
+	sessionTimeout  time.Duration // Parsed duration for internal use
+	secrets         map[string]time.Time // Simple in-memory session store
 }
 
 func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// Apply defaults
+	// Apply defaults and validate
 	if config.TestDomain == "" {
 		return nil, fmt.Errorf("testDomain must be configured")
 	}
-	if config.SessionTimeout == 0 {
-		config.SessionTimeout = 24 * time.Hour
+	
+	// Parse session timeout
+	var sessionTimeout time.Duration
+	var err error
+	
+	if config.SessionTimeout != "" {
+		// Try to parse duration string (e.g., "24h", "30m")
+		sessionTimeout, err = time.ParseDuration(config.SessionTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("invalid sessionTimeout format: %v (use format like '24h', '30m', '45s')", err)
+		}
+	} else if config.SessionTimeoutSeconds > 0 {
+		// Use seconds if provided
+		sessionTimeout = time.Duration(config.SessionTimeoutSeconds) * time.Second
+	} else {
+		// Default to 24 hours
+		sessionTimeout = 24 * time.Hour
 	}
+	
+	// Apply other defaults
 	if config.CustomErrorMessage == "" {
 		config.CustomErrorMessage = "Tailscale connection required to access this service"
 	}
@@ -78,10 +100,11 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	}
 
 	return &TailscaleConnectivityAuth{
-		next:    next,
-		name:    name,
-		config:  config,
-		secrets: make(map[string]time.Time),
+		next:           next,
+		name:           name,
+		config:         config,
+		sessionTimeout: sessionTimeout,
+		secrets:        make(map[string]time.Time),
 	}, nil
 }
 
@@ -151,7 +174,7 @@ func (t *TailscaleConnectivityAuth) handleVerification(rw http.ResponseWriter, r
 	if status == "success" {
 		// Generate verification token
 		token := t.generateToken()
-		expiry := time.Now().Add(t.config.SessionTimeout)
+		expiry := time.Now().Add(t.sessionTimeout)
 		t.secrets[token] = expiry
 
 		// Set secure cookie
@@ -305,42 +328,51 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
             verificationAttempts++;
             
             try {
-                // Test 1: Try to fetch from the Tailscale domain
-                const testUrl = 'https://' + testDomain + '/';
+                // Test 1: Try HTTP first (more reliable for Tailscale domains)
+                const httpUrl = 'http://' + testDomain + '/';
                 
-                // Use fetch with a timeout
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 5000);
+                const controllerHttp = new AbortController();
+                const timeoutIdHttp = setTimeout(() => controllerHttp.abort(), 5000);
                 
-                const response = await fetch(testUrl, {
+                const httpResponse = await fetch(httpUrl, {
                     method: 'GET',
-                    mode: 'no-cors', // This allows the request even if CORS fails
+                    mode: 'no-cors',
                     cache: 'no-cache',
-                    signal: controller.signal
+                    signal: controllerHttp.signal
                 });
                 
-                clearTimeout(timeoutId);
+                clearTimeout(timeoutIdHttp);
+                await reportVerificationResult(true, 'Tailscale domain reachable via HTTP');
                 
-                // If we get here, the domain is reachable
-                await reportVerificationResult(true, 'Tailscale domain reachable');
+            } catch (httpError) {
+                console.log('HTTP test failed:', httpError.message);
                 
-            } catch (error) {
-                console.log('Primary test failed:', error.message);
-                
-                // Test 2: Try alternative method - image loading
+                // Test 2: Try HTTPS fallback
                 try {
-                    await testImageLoad();
-                    await reportVerificationResult(true, 'Tailscale connectivity confirmed via image test');
-                } catch (imgError) {
-                    console.log('Image test failed:', imgError.message);
+                    const httpsUrl = 'https://' + testDomain + '/';
+                    const controllerHttps = new AbortController();
+                    const timeoutIdHttps = setTimeout(() => controllerHttps.abort(), 5000);
                     
-                    // Test 3: Try WebSocket if available
+                    const httpsResponse = await fetch(httpsUrl, {
+                        method: 'GET',
+                        mode: 'no-cors',
+                        cache: 'no-cache',
+                        signal: controllerHttps.signal
+                    });
+                    
+                    clearTimeout(timeoutIdHttps);
+                    await reportVerificationResult(true, 'Tailscale domain reachable via HTTPS');
+                    
+                } catch (httpsError) {
+                    console.log('HTTPS test failed:', httpsError.message);
+                    
+                    // Test 3: Try image loading with HTTP first
                     try {
-                        await testWebSocket();
-                        await reportVerificationResult(true, 'Tailscale connectivity confirmed via WebSocket');
-                    } catch (wsError) {
-                        console.log('WebSocket test failed:', wsError.message);
-                        await reportVerificationResult(false, error.message + ' (all tests failed)');
+                        await testImageLoad();
+                        await reportVerificationResult(true, 'Tailscale connectivity confirmed via image test');
+                    } catch (imgError) {
+                        console.log('Image test failed:', imgError.message);
+                        await reportVerificationResult(false, 'All connectivity tests failed. HTTP: ' + httpError.message + ', HTTPS: ' + httpsError.message);
                     }
                 }
             }
@@ -348,6 +380,7 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
 
         function testImageLoad() {
             return new Promise((resolve, reject) => {
+                // Try HTTP first (more reliable for Tailscale)
                 const img = new Image();
                 const timeout = setTimeout(() => {
                     reject(new Error('Image load timeout'));
@@ -360,11 +393,28 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
                 
                 img.onerror = () => {
                     clearTimeout(timeout);
-                    reject(new Error('Image load failed'));
+                    // Try HTTPS fallback
+                    const img2 = new Image();
+                    const timeout2 = setTimeout(() => {
+                        reject(new Error('Image load failed (both HTTP and HTTPS)'));
+                    }, 3000);
+                    
+                    img2.onload = () => {
+                        clearTimeout(timeout2);
+                        resolve();
+                    };
+                    
+                    img2.onerror = () => {
+                        clearTimeout(timeout2);
+                        reject(new Error('Image load failed (both HTTP and HTTPS)'));
+                    };
+                    
+                    // Try HTTPS as fallback
+                    img2.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
                 };
                 
-                // Try to load a favicon or small image from the Tailscale domain
-                img.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
+                // Try HTTP first
+                img.src = 'http://' + testDomain + '/favicon.ico?t=' + Date.now();
             });
         }
 
