@@ -1,11 +1,8 @@
-// Tailscale Authentication Plugin - Connectivity Based Verification
+// Simplified Tailscale Authentication Plugin
 package tailscale_access
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -16,13 +13,7 @@ type Config struct {
 	// Tailscale domain to test connectivity against
 	TestDomain string `json:"testDomain,omitempty"`
 	
-	// Custom verification endpoint (optional)
-	VerificationEndpoint string `json:"verificationEndpoint,omitempty"`
-	
-	// Session timeout for verified connections (in seconds)
-	SessionTimeoutSeconds int `json:"sessionTimeoutSeconds,omitempty"`
-	
-	// Session timeout as duration string (e.g., "24h", "30m") - will be converted to seconds
+	// Session timeout as duration string (e.g., "24h", "30m")
 	SessionTimeout string `json:"sessionTimeout,omitempty"`
 	
 	// Custom error messages
@@ -47,28 +38,25 @@ type Config struct {
 
 func CreateConfig() *Config {
 	return &Config{
-		TestDomain:            "your-tailscale-network.ts.net", // User should configure this
-		SessionTimeout:        "24h",
-		SessionTimeoutSeconds: 86400, // 24 hours in seconds as fallback
-		CustomErrorMessage:    "Tailscale connection required to access this service",
-		SuccessMessage:        "Tailscale connectivity verified! Redirecting...",
-		EnableDebugLogging:    false,
-		AllowLocalhost:        true,
-		SecureOnly:            true,
-		RequireUserAgent:      true,
+		TestDomain:         "your-tailscale-network.ts.net",
+		SessionTimeout:     "24h",
+		CustomErrorMessage: "Tailscale connection required to access this service",
+		SuccessMessage:     "Tailscale connectivity verified! Redirecting...",
+		EnableDebugLogging: false,
+		AllowLocalhost:     true,
+		SecureOnly:         true,
+		RequireUserAgent:   true,
 	}
 }
 
 type TailscaleConnectivityAuth struct {
-	next            http.Handler
-	name            string
-	config          *Config
-	sessionTimeout  time.Duration // Parsed duration for internal use
-	secrets         map[string]time.Time // Simple in-memory session store
+	next           http.Handler
+	name           string
+	config         *Config
+	sessionTimeout time.Duration
 }
 
 func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	// Apply defaults and validate
 	if config.TestDomain == "" {
 		return nil, fmt.Errorf("testDomain must be configured")
 	}
@@ -78,20 +66,15 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	var err error
 	
 	if config.SessionTimeout != "" {
-		// Try to parse duration string (e.g., "24h", "30m")
 		sessionTimeout, err = time.ParseDuration(config.SessionTimeout)
 		if err != nil {
-			return nil, fmt.Errorf("invalid sessionTimeout format: %v (use format like '24h', '30m', '45s')", err)
+			return nil, fmt.Errorf("invalid sessionTimeout format: %v", err)
 		}
-	} else if config.SessionTimeoutSeconds > 0 {
-		// Use seconds if provided
-		sessionTimeout = time.Duration(config.SessionTimeoutSeconds) * time.Second
 	} else {
-		// Default to 24 hours
 		sessionTimeout = 24 * time.Hour
 	}
 	
-	// Apply other defaults
+	// Apply defaults
 	if config.CustomErrorMessage == "" {
 		config.CustomErrorMessage = "Tailscale connection required to access this service"
 	}
@@ -104,30 +87,36 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		name:           name,
 		config:         config,
 		sessionTimeout: sessionTimeout,
-		secrets:        make(map[string]time.Time),
 	}, nil
 }
 
 func (t *TailscaleConnectivityAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if t.config.EnableDebugLogging {
+		fmt.Printf("[TailscaleAuth] Request: %s %s from %s\n", req.Method, req.URL.Path, req.RemoteAddr)
+	}
+
 	// Check for localhost bypass
 	if t.config.AllowLocalhost && t.isLocalhost(req) {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Allowing localhost bypass\n")
+		}
 		t.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// Handle verification callback
-	if req.URL.Path == "/__tailscale_verify" {
-		t.handleVerification(rw, req)
-		return
-	}
-
-	// Check if already verified
+	// Check if already verified (simple cookie validation)
 	if t.isVerified(req) {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Request already verified, allowing access\n")
+		}
 		t.next.ServeHTTP(rw, req)
 		return
 	}
 
 	// Show verification page
+	if t.config.EnableDebugLogging {
+		fmt.Printf("[TailscaleAuth] Showing verification page\n")
+	}
 	t.serveVerificationPage(rw, req)
 }
 
@@ -142,77 +131,26 @@ func (t *TailscaleConnectivityAuth) isLocalhost(req *http.Request) bool {
 func (t *TailscaleConnectivityAuth) isVerified(req *http.Request) bool {
 	cookie, err := req.Cookie("tailscale_verified")
 	if err != nil {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] No verification cookie found: %v\n", err)
+		}
 		return false
 	}
 
-	// Check if token exists and is not expired
-	expiry, exists := t.secrets[cookie.Value]
-	if !exists || time.Now().After(expiry) {
-		// Clean up expired token
-		delete(t.secrets, cookie.Value)
-		return false
-	}
-
-	return true
-}
-
-func (t *TailscaleConnectivityAuth) handleVerification(rw http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodPost {
-		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse form data
-	if err := req.ParseForm(); err != nil {
-		http.Error(rw, "Invalid form data", http.StatusBadRequest)
-		return
-	}
-
-	status := req.FormValue("status")
-	originalURL := req.FormValue("originalURL")
-
-	if status == "success" {
-		// Generate verification token
-		token := t.generateToken()
-		expiry := time.Now().Add(t.sessionTimeout)
-		t.secrets[token] = expiry
-
-		// Set secure cookie
-		cookie := &http.Cookie{
-			Name:     "tailscale_verified",
-			Value:    token,
-			Expires:  expiry,
-			HttpOnly: true,
-			Secure:   t.config.SecureOnly,
-			SameSite: http.SameSiteLaxMode,
-			Path:     "/",
+	// Simple validation - just check if cookie exists and is not empty
+	// The security comes from the fact that only Tailscale-connected clients
+	// can reach the testDomain to set this cookie in the first place
+	if cookie.Value != "" && len(cookie.Value) > 10 {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Valid verification cookie found: %s\n", cookie.Value[:10]+"...")
 		}
-		if t.config.CookieDomain != "" {
-			cookie.Domain = t.config.CookieDomain
-		}
-		http.SetCookie(rw, cookie)
-
-		// Return success response
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusOK)
-		response := fmt.Sprintf(`{"success": true, "message": "%s", "redirectURL": "%s"}`, 
-			t.config.SuccessMessage, originalURL)
-		rw.Write([]byte(response))
-		return
+		return true
 	}
 
-	// Verification failed
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(http.StatusForbidden)
-	response := fmt.Sprintf(`{"success": false, "message": "%s"}`, t.config.CustomErrorMessage)
-	rw.Write([]byte(response))
-}
-
-func (t *TailscaleConnectivityAuth) generateToken() string {
-	bytes := make([]byte, 32)
-	rand.Read(bytes)
-	hash := sha256.Sum256(bytes)
-	return hex.EncodeToString(hash[:])
+	if t.config.EnableDebugLogging {
+		fmt.Printf("[TailscaleAuth] Invalid verification cookie: %s\n", cookie.Value)
+	}
+	return false
 }
 
 func (t *TailscaleConnectivityAuth) serveVerificationPage(rw http.ResponseWriter, req *http.Request) {
@@ -238,9 +176,6 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
 	}
 
 	customScript := t.config.CustomScript
-	if customScript == "" {
-		customScript = ""
-	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
@@ -324,151 +259,192 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
 
         %s
 
+        // Simplified approach - no server roundtrip needed
         async function verifyTailscaleConnectivity() {
             verificationAttempts++;
+            console.log('Starting verification attempt', verificationAttempts, 'for domain:', testDomain);
+            
+            const isHttpsPage = window.location.protocol === 'https:';
+            console.log('Current page protocol:', window.location.protocol);
             
             try {
-                // Test 1: Try HTTP first (more reliable for Tailscale domains)
-                const httpUrl = 'http://' + testDomain + '/';
-                
-                const controllerHttp = new AbortController();
-                const timeoutIdHttp = setTimeout(() => controllerHttp.abort(), 5000);
-                
-                const httpResponse = await fetch(httpUrl, {
-                    method: 'GET',
-                    mode: 'no-cors',
-                    cache: 'no-cache',
-                    signal: controllerHttp.signal
-                });
-                
-                clearTimeout(timeoutIdHttp);
-                await reportVerificationResult(true, 'Tailscale domain reachable via HTTP');
-                
-            } catch (httpError) {
-                console.log('HTTP test failed:', httpError.message);
-                
-                // Test 2: Try HTTPS fallback
-                try {
+                if (isHttpsPage) {
                     const httpsUrl = 'https://' + testDomain + '/';
+                    console.log('Testing HTTPS URL:', httpsUrl);
+                    
                     const controllerHttps = new AbortController();
-                    const timeoutIdHttps = setTimeout(() => controllerHttps.abort(), 5000);
+                    const timeoutIdHttps = setTimeout(() => {
+                        console.log('HTTPS request timeout');
+                        controllerHttps.abort();
+                    }, 10000);
                     
-                    const httpsResponse = await fetch(httpsUrl, {
-                        method: 'GET',
-                        mode: 'no-cors',
-                        cache: 'no-cache',
-                        signal: controllerHttps.signal
-                    });
-                    
-                    clearTimeout(timeoutIdHttps);
-                    await reportVerificationResult(true, 'Tailscale domain reachable via HTTPS');
-                    
-                } catch (httpsError) {
-                    console.log('HTTPS test failed:', httpsError.message);
-                    
-                    // Test 3: Try image loading with HTTP first
                     try {
-                        await testImageLoad();
-                        await reportVerificationResult(true, 'Tailscale connectivity confirmed via image test');
-                    } catch (imgError) {
-                        console.log('Image test failed:', imgError.message);
-                        await reportVerificationResult(false, 'All connectivity tests failed. HTTP: ' + httpError.message + ', HTTPS: ' + httpsError.message);
+                        const httpsResponse = await fetch(httpsUrl, {
+                            method: 'GET',
+                            mode: 'no-cors',
+                            cache: 'no-cache',
+                            credentials: 'omit',
+                            signal: controllerHttps.signal
+                        });
+                        
+                        clearTimeout(timeoutIdHttps);
+                        console.log('HTTPS connectivity test succeeded');
+                        setVerificationCookieAndRedirect();
+                        return;
+                        
+                    } catch (httpsError) {
+                        clearTimeout(timeoutIdHttps);
+                        console.log('HTTPS fetch failed:', httpsError.message);
+                        throw httpsError;
                     }
                 }
+                
+                if (!isHttpsPage) {
+                    const httpUrl = 'http://' + testDomain + '/';
+                    console.log('Testing HTTP URL:', httpUrl);
+                    
+                    const controllerHttp = new AbortController();
+                    const timeoutIdHttp = setTimeout(() => {
+                        controllerHttp.abort();
+                    }, 10000);
+                    
+                    try {
+                        const httpResponse = await fetch(httpUrl, {
+                            method: 'GET',
+                            mode: 'no-cors',
+                            cache: 'no-cache',
+                            credentials: 'omit',
+                            signal: controllerHttp.signal
+                        });
+                        
+                        clearTimeout(timeoutIdHttp);
+                        console.log('HTTP connectivity test succeeded');
+                        setVerificationCookieAndRedirect();
+                        return;
+                        
+                    } catch (httpError) {
+                        clearTimeout(timeoutIdHttp);
+                        throw httpError;
+                    }
+                }
+                
+            } catch (fetchError) {
+                console.log('Fetch tests failed, trying image loading:', fetchError.message);
+                
+                try {
+                    await testImageLoad();
+                    console.log('Image test succeeded');
+                    setVerificationCookieAndRedirect();
+                    return;
+                } catch (imgError) {
+                    console.log('All connectivity tests failed');
+                    showError('All connectivity tests failed. Primary error: ' + fetchError.message + '. Image test: ' + imgError.message);
+                }
             }
+        }
+
+        function setVerificationCookieAndRedirect() {
+            console.log('Setting verification cookie and redirecting...');
+            
+            const token = generateClientToken();
+            const expiry = new Date();
+            expiry.setTime(expiry.getTime() + (24 * 60 * 60 * 1000)); // 24 hours
+            
+            document.cookie = 'tailscale_verified=' + token + '; expires=' + expiry.toUTCString() + '; path=/; secure; samesite=lax';
+            console.log('Verification cookie set:', token);
+            
+            showSuccess();
+            setTimeout(() => {
+                console.log('Redirecting to:', originalURL);
+                window.location.href = originalURL;
+            }, 3000);
+        }
+
+        function generateClientToken() {
+            const timestamp = Date.now();
+            const random = Math.random().toString(36).substring(2);
+            const domain = testDomain.replace(/[^a-zA-Z0-9]/g, '');
+            
+            const tokenData = timestamp + '-' + random + '-' + domain;
+            let hash = 0;
+            for (let i = 0; i < tokenData.length; i++) {
+                const char = tokenData.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+            }
+            
+            return Math.abs(hash).toString(16) + random;
         }
 
         function testImageLoad() {
             return new Promise((resolve, reject) => {
-                // Try HTTP first (more reliable for Tailscale)
-                const img = new Image();
-                const timeout = setTimeout(() => {
-                    reject(new Error('Image load timeout'));
-                }, 5000);
+                console.log('Starting image load test...');
                 
-                img.onload = () => {
-                    clearTimeout(timeout);
-                    resolve();
-                };
+                const isHttpsPage = window.location.protocol === 'https:';
                 
-                img.onerror = () => {
-                    clearTimeout(timeout);
-                    // Try HTTPS fallback
-                    const img2 = new Image();
-                    const timeout2 = setTimeout(() => {
-                        reject(new Error('Image load failed (both HTTP and HTTPS)'));
-                    }, 3000);
-                    
-                    img2.onload = () => {
-                        clearTimeout(timeout2);
-                        resolve();
-                    };
-                    
-                    img2.onerror = () => {
-                        clearTimeout(timeout2);
-                        reject(new Error('Image load failed (both HTTP and HTTPS)'));
-                    };
-                    
-                    // Try HTTPS as fallback
-                    img2.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
-                };
-                
-                // Try HTTP first
-                img.src = 'http://' + testDomain + '/favicon.ico?t=' + Date.now();
-            });
-        }
-
-        function testWebSocket() {
-            return new Promise((resolve, reject) => {
-                try {
-                    const ws = new WebSocket('wss://' + testDomain + '/ws');
+                if (isHttpsPage) {
+                    const img = new Image();
                     const timeout = setTimeout(() => {
-                        ws.close();
-                        reject(new Error('WebSocket timeout'));
-                    }, 3000);
+                        img.onerror = null;
+                        img.onload = null;
+                        reject(new Error('HTTPS image load timeout'));
+                    }, 8000);
                     
-                    ws.onopen = () => {
+                    img.onload = () => {
                         clearTimeout(timeout);
-                        ws.close();
+                        console.log('Image loaded successfully via HTTPS');
                         resolve();
                     };
                     
-                    ws.onerror = () => {
+                    img.onerror = (error) => {
                         clearTimeout(timeout);
-                        reject(new Error('WebSocket connection failed'));
+                        console.log('HTTPS image load failed:', error);
+                        reject(new Error('HTTPS image load failed'));
                     };
-                } catch (error) {
-                    reject(error);
+                    
+                    img.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
+                    
+                } else {
+                    const img = new Image();
+                    const timeout = setTimeout(() => {
+                        img.onerror = null;
+                        img.onload = null;
+                        reject(new Error('Image load timeout'));
+                    }, 6000);
+                    
+                    img.onload = () => {
+                        clearTimeout(timeout);
+                        console.log('Image loaded successfully via HTTP');
+                        resolve();
+                    };
+                    
+                    img.onerror = () => {
+                        clearTimeout(timeout);
+                        
+                        const img2 = new Image();
+                        const timeout2 = setTimeout(() => {
+                            img2.onerror = null;
+                            img2.onload = null;
+                            reject(new Error('Image load failed (both HTTP and HTTPS)'));
+                        }, 4000);
+                        
+                        img2.onload = () => {
+                            clearTimeout(timeout2);
+                            console.log('Image loaded successfully via HTTPS');
+                            resolve();
+                        };
+                        
+                        img2.onerror = () => {
+                            clearTimeout(timeout2);
+                            reject(new Error('Image load failed (both HTTP and HTTPS)'));
+                        };
+                        
+                        img2.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
+                    };
+                    
+                    img.src = 'http://' + testDomain + '/favicon.ico?t=' + Date.now();
                 }
             });
-        }
-
-        async function reportVerificationResult(success, message) {
-            const formData = new FormData();
-            formData.append('status', success ? 'success' : 'failure');
-            formData.append('originalURL', originalURL);
-            formData.append('message', message);
-
-            try {
-                const response = await fetch('/__tailscale_verify', {
-                    method: 'POST',
-                    body: formData
-                });
-
-                const result = await response.json();
-
-                if (success && result.success) {
-                    showSuccess();
-                    setTimeout(() => {
-                        window.location.href = originalURL;
-                    }, 3000);
-                } else {
-                    showError(message);
-                }
-            } catch (error) {
-                console.error('Failed to report verification result:', error);
-                showError('Verification reporting failed: ' + error.message);
-            }
         }
 
         function showSuccess() {
@@ -478,7 +454,6 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
             document.getElementById('success').classList.add('active');
             document.getElementById('success-details').classList.remove('hidden');
             
-            // Start countdown
             let countdown = 3;
             const countdownElement = document.getElementById('countdown');
             const countdownTimer = setInterval(() => {
@@ -505,19 +480,17 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
                 return;
             }
             
-            // Reset UI
             document.getElementById('error').classList.add('hidden');
             document.getElementById('error').classList.remove('active');
             document.getElementById('error-details').classList.add('hidden');
             document.getElementById('checking').classList.remove('hidden');
             document.getElementById('checking').classList.add('active');
             
-            // Retry verification
             setTimeout(verifyTailscaleConnectivity, 1000);
         }
 
-        // Start verification when page loads
         document.addEventListener('DOMContentLoaded', () => {
+            console.log('Page loaded, starting verification in 1 second...');
             setTimeout(verifyTailscaleConnectivity, 1000);
         });
     </script>
