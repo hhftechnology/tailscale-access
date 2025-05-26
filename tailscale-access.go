@@ -1,41 +1,31 @@
-// Simplified Tailscale Authentication Plugin
+// tailscale-access.go
 package tailscale_access
 
 import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// Config struct definition
 type Config struct {
-	// Tailscale domain to test connectivity against
-	TestDomain string `json:"testDomain,omitempty"`
-	
-	// Session timeout as duration string (e.g., "24h", "30m")
-	SessionTimeout string `json:"sessionTimeout,omitempty"`
-	
-	// Custom error messages
+	TestDomain         string `json:"testDomain,omitempty"`
+	SessionTimeout     string `json:"sessionTimeout,omitempty"`
 	CustomErrorMessage string `json:"customErrorMessage,omitempty"`
 	SuccessMessage     string `json:"successMessage,omitempty"`
-	
-	// Enable debug logging
-	EnableDebugLogging bool `json:"enableDebugLogging,omitempty"`
-	
-	// Bypass for development
-	AllowLocalhost bool `json:"allowLocalhost,omitempty"`
-	
-	// Custom styling
-	CustomCSS    string `json:"customCSS,omitempty"`
-	CustomScript string `json:"customScript,omitempty"`
-	
-	// Security settings
-	SecureOnly        bool   `json:"secureOnly,omitempty"`
-	CookieDomain      string `json:"cookieDomain,omitempty"`
-	RequireUserAgent  bool   `json:"requireUserAgent,omitempty"`
+	EnableDebugLogging bool   `json:"enableDebugLogging,omitempty"`
+	AllowLocalhost     bool   `json:"allowLocalhost,omitempty"`
+	CustomCSS          string `json:"customCSS,omitempty"`
+	CustomScript       string `json:"customScript,omitempty"`
+	SecureOnly         bool   `json:"secureOnly,omitempty"`
+	CookieDomain       string `json:"cookieDomain,omitempty"`
+	RequireUserAgent   bool   `json:"requireUserAgent,omitempty"`
 }
 
+// CreateConfig function
 func CreateConfig() *Config {
 	return &Config{
 		TestDomain:         "your-tailscale-network.ts.net",
@@ -56,27 +46,46 @@ type TailscaleConnectivityAuth struct {
 	sessionTimeout time.Duration
 }
 
+// Cookie Status constants
+const (
+	NO_COOKIE = iota
+	INVALID_FORMAT_COOKIE
+	EXPIRED_COOKIE
+	STALE_COOKIE
+	FRESH_COOKIE
+)
+
+type CookieStatusResult struct {
+	Status    int
+	Timestamp int64 // milliseconds, if parsable
+	Token     string // if parsable
+}
+
 func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	if config.TestDomain == "" {
 		return nil, fmt.Errorf("testDomain must be configured")
 	}
-	
-	// Parse session timeout
+
 	var sessionTimeout time.Duration
 	var err error
-	
+
 	if config.SessionTimeout != "" {
 		sessionTimeout, err = time.ParseDuration(config.SessionTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("invalid sessionTimeout format: %v", err)
 		}
 	} else {
-		sessionTimeout = 24 * time.Hour
+		sessionTimeout = 24 * time.Hour // Default
 	}
-	
-	// Apply defaults
+	if sessionTimeout <= 0 { // Ensure positive duration
+		sessionTimeout = 24 * time.Hour
+		if config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Warning: sessionTimeout was invalid or zero, reset to 24h\n")
+		}
+	}
+
 	if config.CustomErrorMessage == "" {
-		config.CustomErrorMessage = "Tailscale connection required to access this service"
+		config.CustomErrorMessage = "Tailscale connection required to access this service."
 	}
 	if config.SuccessMessage == "" {
 		config.SuccessMessage = "Tailscale connectivity verified! Redirecting..."
@@ -90,34 +99,128 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 	}, nil
 }
 
+func (t *TailscaleConnectivityAuth) getCookieStatus(req *http.Request) CookieStatusResult {
+	cookie, err := req.Cookie("tailscale_verified")
+	if err != nil {
+		return CookieStatusResult{Status: NO_COOKIE}
+	}
+
+	parts := strings.SplitN(cookie.Value, ".", 2)
+	if len(parts) != 2 {
+		return CookieStatusResult{Status: INVALID_FORMAT_COOKIE}
+	}
+
+	timestampMs, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return CookieStatusResult{Status: INVALID_FORMAT_COOKIE}
+	}
+
+	token := parts[1]
+	if len(token) < 10 { // Basic sanity check for the token part
+		return CookieStatusResult{Status: INVALID_FORMAT_COOKIE}
+	}
+
+	currentTimeMs := time.Now().UnixNano() / int64(time.Millisecond)
+	cookieAgeMs := currentTimeMs - timestampMs
+
+	if cookieAgeMs < 0 {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Cookie has future timestamp (age: %d ms), invalid.\n", cookieAgeMs)
+		}
+		return CookieStatusResult{Status: INVALID_FORMAT_COOKIE}
+	}
+
+	sessionTimeoutMs := t.sessionTimeout.Milliseconds()
+	if sessionTimeoutMs <= 0 { // Should be caught by New()
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Critical Error: sessionTimeoutMs is zero or negative in getCookieStatus.\n")
+		}
+		return CookieStatusResult{Status: EXPIRED_COOKIE} // Treat as immediately expired
+	}
+
+	if cookieAgeMs >= sessionTimeoutMs {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Cookie EXPIRED: age %d ms, sessionTimeout %d ms\n", cookieAgeMs, sessionTimeoutMs)
+		}
+		return CookieStatusResult{Status: EXPIRED_COOKIE, Timestamp: timestampMs, Token: token}
+	}
+
+	// Stale if cookieAgeMs is in the last 20% of its lifetime.
+	staleAgeThresholdMs := sessionTimeoutMs * 80 / 100
+	if cookieAgeMs >= staleAgeThresholdMs {
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Cookie STALE: age %d ms, stale_threshold %d ms, sessionTimeout %d ms\n", cookieAgeMs, staleAgeThresholdMs, sessionTimeoutMs)
+		}
+		return CookieStatusResult{Status: STALE_COOKIE, Timestamp: timestampMs, Token: token}
+	}
+
+	if t.config.EnableDebugLogging {
+		fmt.Printf("[TailscaleAuth] Cookie FRESH: age %d ms, sessionTimeout %d ms\n", cookieAgeMs, sessionTimeoutMs)
+	}
+	return CookieStatusResult{Status: FRESH_COOKIE, Timestamp: timestampMs, Token: token}
+}
+
 func (t *TailscaleConnectivityAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if t.config.EnableDebugLogging {
-		fmt.Printf("[TailscaleAuth] Request: %s %s from %s\n", req.Method, req.URL.Path, req.RemoteAddr)
+		fmt.Printf("[TailscaleAuth] Request: %s %s from %s, Host: %s\n", req.Method, req.URL.String(), req.RemoteAddr, req.Host)
 	}
 
-	// Check for localhost bypass
 	if t.config.AllowLocalhost && t.isLocalhost(req) {
 		if t.config.EnableDebugLogging {
-			fmt.Printf("[TailscaleAuth] Allowing localhost bypass\n")
+			fmt.Printf("[TailscaleAuth] Allowing localhost bypass for %s\n", req.Host)
 		}
 		t.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// Check if already verified (simple cookie validation)
-	if t.isVerified(req) {
+	if t.config.RequireUserAgent {
+		if req.Header.Get("User-Agent") == "" {
+			if t.config.EnableDebugLogging {
+				fmt.Printf("[TailscaleAuth] Missing User-Agent for %s, showing verification page\n", req.URL.String())
+			}
+			t.serveVerificationPage(rw, req) // Treat as unverified
+			return
+		}
+	}
+
+	cookieCheckResult := t.getCookieStatus(req)
+
+	switch cookieCheckResult.Status {
+	case FRESH_COOKIE:
 		if t.config.EnableDebugLogging {
-			fmt.Printf("[TailscaleAuth] Request already verified, allowing access\n")
+			fmt.Printf("[TailscaleAuth] FRESH_COOKIE for %s, allowing access.\n", req.URL.String())
 		}
 		t.next.ServeHTTP(rw, req)
 		return
+	case STALE_COOKIE:
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] STALE_COOKIE for %s %s.\n", req.Method, req.URL.String())
+		}
+		if req.Method == http.MethodGet {
+			if t.config.EnableDebugLogging {
+				fmt.Printf("[TailscaleAuth] Attempting silent refresh for GET request.\n")
+			}
+			t.serveSilentRefreshPage(rw, req, req.URL.String()) // Pass originalURL for redirection
+		} else {
+			if t.config.EnableDebugLogging {
+				fmt.Printf("[TailscaleAuth] Stale cookie on non-GET request (%s), allowing to avoid disruption.\n", req.Method)
+			}
+			t.next.ServeHTTP(rw, req) // Allow current non-GET, next GET will refresh
+		}
+		return
+	case NO_COOKIE, INVALID_FORMAT_COOKIE, EXPIRED_COOKIE:
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Cookie status %d for %s, showing full verification page.\n", cookieCheckResult.Status, req.URL.String())
+		}
+		t.serveVerificationPage(rw, req)
+		return
+	default:
+		if t.config.EnableDebugLogging {
+			fmt.Printf("[TailscaleAuth] Unknown cookie status %d for %s, showing full verification page as fallback.\n", cookieCheckResult.Status, req.URL.String())
+		}
+		t.serveVerificationPage(rw, req)
+		return
 	}
-
-	// Show verification page
-	if t.config.EnableDebugLogging {
-		fmt.Printf("[TailscaleAuth] Showing verification page\n")
-	}
-	t.serveVerificationPage(rw, req)
 }
 
 func (t *TailscaleConnectivityAuth) isLocalhost(req *http.Request) bool {
@@ -125,57 +228,156 @@ func (t *TailscaleConnectivityAuth) isLocalhost(req *http.Request) bool {
 	if strings.Contains(host, ":") {
 		host = strings.Split(host, ":")[0]
 	}
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
-}
-
-func (t *TailscaleConnectivityAuth) isVerified(req *http.Request) bool {
-	cookie, err := req.Cookie("tailscale_verified")
-	if err != nil {
-		if t.config.EnableDebugLogging {
-			fmt.Printf("[TailscaleAuth] No verification cookie found: %v\n", err)
-		}
-		return false
-	}
-
-	// Simple validation - just check if cookie exists and is not empty
-	// The security comes from the fact that only Tailscale-connected clients
-	// can reach the testDomain to set this cookie in the first place
-	if cookie.Value != "" && len(cookie.Value) > 10 {
-		if t.config.EnableDebugLogging {
-			fmt.Printf("[TailscaleAuth] Valid verification cookie found: %s\n", cookie.Value[:10]+"...")
-		}
-		return true
-	}
-
-	if t.config.EnableDebugLogging {
-		fmt.Printf("[TailscaleAuth] Invalid verification cookie: %s\n", cookie.Value)
-	}
-	return false
+	return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
 }
 
 func (t *TailscaleConnectivityAuth) serveVerificationPage(rw http.ResponseWriter, req *http.Request) {
-	// Get the original URL for redirect after verification
 	originalURL := req.URL.String()
-	if req.URL.RawQuery != "" {
-		originalURL = req.URL.Path + "?" + req.URL.RawQuery
-	} else {
-		originalURL = req.URL.Path
-	}
 
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+	rw.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
+	rw.Header().Set("Expires", "0")
+	rw.Header().Set("Pragma", "no-cache")
 	rw.WriteHeader(http.StatusOK)
 
 	html := t.generateVerificationHTML(originalURL)
-	rw.Write([]byte(html))
+	_, _ = rw.Write([]byte(html))
+}
+
+func (t *TailscaleConnectivityAuth) serveSilentRefreshPage(rw http.ResponseWriter, req *http.Request, originalURL string) {
+	sessionTimeoutMilliseconds := t.sessionTimeout.Milliseconds()
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Verifying Session...</title>
+    <script>
+        const testDomain = '%s';
+        const originalURL = '%s';
+        const sessionTimeoutMilliseconds = %d;
+        const cookieDomain = '%s'; // String, empty if not set
+        const secureFlag = %t;   // Boolean true/false
+
+        async function silentVerifyAndRefresh() {
+            if (typeof console !== 'undefined' && console.log) {
+                console.log('TailscaleAuth: Performing silent verification for original URL:', originalURL);
+            }
+            let verified = false;
+            try {
+                let connectivityTestUrl = testDomain;
+                if (!connectivityTestUrl.startsWith('http://') && !connectivityTestUrl.startsWith('https://')) {
+                    connectivityTestUrl = (window.location.protocol === 'https:' ? 'https://' : 'http://') + testDomain;
+                }
+                connectivityTestUrl += (connectivityTestUrl.includes('?') ? '&' : '?') + 'ts_refresh_v3=' + Date.now();
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 6000); // 6s timeout
+
+                try {
+                    await fetch(connectivityTestUrl, {
+                        method: 'GET', mode: 'no-cors', cache: 'no-cache', credentials: 'omit', signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    verified = true;
+                    if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Silent fetch verification successful.');
+                } catch (fetchError) {
+                    clearTimeout(timeoutId);
+                    if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Silent fetch failed:', fetchError.message, '. Trying image fallback.');
+                    
+                    try {
+                        await new Promise((resolve, reject) => {
+                            const img = new Image();
+                            const imgTimeout = setTimeout(() => {
+                                img.onerror = null; img.onload = null;
+                                reject(new Error('TailscaleAuth: Silent image load timeout'));
+                            }, 4000); // 4s for image
+                            img.onload = () => { clearTimeout(imgTimeout); resolve(); };
+                            img.onerror = (errEvent) => { clearTimeout(imgTimeout); reject(new Error('TailscaleAuth: Silent image load failed - ' + (errEvent ? errEvent.type : 'unknown error'))); };
+                            
+                            let imgBaseUrl = testDomain;
+                            if (!imgBaseUrl.startsWith('http://') && !imgBaseUrl.startsWith('https://')) {
+                                imgBaseUrl = (window.location.protocol === 'https:' ? 'https://' : 'http://') + testDomain;
+                            }
+                            const urlObj = new URL(imgBaseUrl);
+                            img.src = urlObj.protocol + '//' + urlObj.host + '/favicon.ico?ts_refresh_img_v3=' + Date.now();
+                        });
+                        verified = true;
+                        if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Silent image verification successful.');
+                    } catch (imgError) {
+                        if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Silent image verification failed:', imgError.message);
+                    }
+                }
+            } catch (e) {
+                if (typeof console !== 'undefined' && console.error) console.error('TailscaleAuth: Error during silent verification:', e);
+            }
+
+            if (verified) {
+                const newTimestamp = Date.now();
+                const newTokenPart = Array(16).fill(0).map(() => Math.floor(Math.random() * 36).toString(36)).join('');
+                const cookieValue = newTimestamp + "." + newTokenPart;
+                
+                const expiry = new Date();
+                expiry.setTime(newTimestamp + sessionTimeoutMilliseconds);
+                
+                let cookieString = 'tailscale_verified=' + cookieValue +
+                                   '; expires=' + expiry.toUTCString() +
+                                   '; path=/;';
+                if (cookieDomain) { cookieString += ' domain=' + cookieDomain + ';'; }
+                if (secureFlag) { cookieString += ' secure;'; }
+                cookieString += ' samesite=lax';
+                document.cookie = cookieString;
+                if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Cookie refreshed. Redirecting to:', originalURL);
+            } else {
+                if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Silent verification failed. Clearing cookie.');
+                let expiryPast = new Date(0).toUTCString();
+                let clearCookieString = 'tailscale_verified=; expires=' + expiryPast + '; path=/;';
+                if (cookieDomain) { clearCookieString += ' domain=' + cookieDomain + ';'; }
+                document.cookie = clearCookieString;
+                if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Cookie cleared. Redirecting to original URL:', originalURL);
+            }
+            window.location.href = originalURL; // Always redirect
+        }
+        
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', silentVerifyAndRefresh);
+        } else {
+            silentVerifyAndRefresh();
+        }
+    </script>
+</head>
+<body><p>Verifying session...</p></body>
+</html>`,
+		t.config.TestDomain,
+		originalURL,
+		sessionTimeoutMilliseconds,
+		t.config.CookieDomain,
+		t.config.SecureOnly,
+	)
+	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+	rw.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
+	rw.Header().Set("Expires", "0")
+	rw.Header().Set("Pragma", "no-cache")
+	rw.WriteHeader(http.StatusOK)
+	_, _ = rw.Write([]byte(html))
 }
 
 func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string) string {
 	customCSS := t.config.CustomCSS
 	if customCSS == "" {
-		customCSS = t.getDefaultCSS()
+		customCSS = t.getDefaultCSS() // This will use the updated CSS
 	}
-
 	customScript := t.config.CustomScript
+	sessionTimeoutMilliseconds := t.sessionTimeout.Milliseconds()
+
+	secureCookieFlagString := ""
+	if t.config.SecureOnly {
+		secureCookieFlagString = "secure;"
+	}
+	cookieDomainDirective := ""
+	if t.config.CookieDomain != "" {
+		cookieDomainDirective = fmt.Sprintf("domain=%s;", t.config.CookieDomain)
+	}
 
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
@@ -189,35 +391,15 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
     <div class="container">
         <div class="verification-card">
             <div class="header">
-                <div class="tailscale-logo">
-                    <svg width="40" height="40" viewBox="0 0 100 100" fill="none">
-                        <circle cx="50" cy="50" r="45" fill="#000"/>
-                        <path d="M25 35h50v30H25z" fill="#fff"/>
-                        <circle cx="35" cy="50" r="5" fill="#000"/>
-                        <circle cx="65" cy="50" r="5" fill="#000"/>
-                    </svg>
-                </div>
+                <div class="tailscale-logo"><svg width="40" height="40" viewBox="0 0 100 100" fill="none"><circle cx="50" cy="50" r="45" fill="#000"/><path d="M25 35h50v30H25z" fill="#fff"/><circle cx="35" cy="50" r="5" fill="#000"/><circle cx="65" cy="50" r="5" fill="#000"/></svg></div>
                 <h1>Tailscale Verification</h1>
                 <p>Verifying your Tailscale connection...</p>
             </div>
-
             <div class="status-container">
-                <div id="checking" class="status-item active">
-                    <div class="spinner"></div>
-                    <span>Testing Tailscale connectivity...</span>
-                </div>
-                
-                <div id="success" class="status-item success hidden">
-                    <div class="check-icon">✓</div>
-                    <span>Tailscale connection verified!</span>
-                </div>
-                
-                <div id="error" class="status-item error hidden">
-                    <div class="error-icon">✗</div>
-                    <span>Tailscale connection not detected</span>
-                </div>
+                <div id="checking" class="status-item active"><div class="spinner"></div><span>Testing Tailscale connectivity...</span></div>
+                <div id="success" class="status-item success hidden"><div class="check-icon">✓</div><span>Tailscale connection verified!</span></div>
+                <div id="error" class="status-item error hidden"><div class="error-icon">✗</div><span>Tailscale connection not detected</span></div>
             </div>
-
             <div id="error-details" class="error-details hidden">
                 <h3>How to connect via Tailscale:</h3>
                 <ol>
@@ -225,284 +407,188 @@ func (t *TailscaleConnectivityAuth) generateVerificationHTML(originalURL string)
                     <li><strong>Connect to your network</strong> and ensure you can access <code>%s</code></li>
                     <li><strong>Refresh this page</strong> to try again</li>
                 </ol>
-                
                 <div class="technical-details">
-                    <details>
-                        <summary>Technical Details</summary>
+                    <details><summary>Technical Details</summary>
                         <p>This service requires access through a Tailscale network. We test connectivity by attempting to reach your Tailscale domain.</p>
                         <p><strong>Test Domain:</strong> <code>%s</code></p>
                         <p><strong>Error:</strong> <span id="error-message">Connection failed</span></p>
                     </details>
                 </div>
-                
-                <button onclick="retryVerification()" class="retry-button">
-                    <span class="retry-icon">↻</span>
-                    Try Again
-                </button>
+                <button onclick="retryVerification()" class="retry-button"><span class="retry-icon">↻</span> Try Again</button>
             </div>
-
             <div id="success-details" class="success-details hidden">
                 <p>%s</p>
-                <div class="progress-bar">
-                    <div class="progress-fill"></div>
-                </div>
+                <div class="progress-bar"><div class="progress-fill"></div></div>
                 <p class="redirect-text">Redirecting in <span id="countdown">3</span> seconds...</p>
             </div>
         </div>
     </div>
-
     <script>
         let verificationAttempts = 0;
         const maxAttempts = 3;
         const testDomain = '%s';
         const originalURL = '%s';
+        const sessionTimeoutMilliseconds = %d;
 
-        %s
+        %s // Custom Script Placeholder
 
-        // Simplified approach - no server roundtrip needed
         async function verifyTailscaleConnectivity() {
             verificationAttempts++;
-            console.log('Starting verification attempt', verificationAttempts, 'for domain:', testDomain);
+            const checkingDiv = document.getElementById('checking');
+            const errorDiv = document.getElementById('error');
+            const errorDetailsDiv = document.getElementById('error-details');
+
+            if(checkingDiv) { checkingDiv.classList.add('active'); checkingDiv.classList.remove('hidden'); }
+            if(errorDiv) errorDiv.classList.add('hidden');
+            if(errorDetailsDiv) errorDetailsDiv.classList.add('hidden');
             
-            const isHttpsPage = window.location.protocol === 'https:';
-            console.log('Current page protocol:', window.location.protocol);
+            if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Verification attempt', verificationAttempts, 'for domain:', testDomain);
             
+            let verified = false;
+            let lastErrorMessage = 'Connectivity tests failed.';
             try {
-                if (isHttpsPage) {
-                    const httpsUrl = 'https://' + testDomain + '/';
-                    console.log('Testing HTTPS URL:', httpsUrl);
-                    
-                    const controllerHttps = new AbortController();
-                    const timeoutIdHttps = setTimeout(() => {
-                        console.log('HTTPS request timeout');
-                        controllerHttps.abort();
-                    }, 10000);
-                    
-                    try {
-                        const httpsResponse = await fetch(httpsUrl, {
-                            method: 'GET',
-                            mode: 'no-cors',
-                            cache: 'no-cache',
-                            credentials: 'omit',
-                            signal: controllerHttps.signal
-                        });
-                        
-                        clearTimeout(timeoutIdHttps);
-                        console.log('HTTPS connectivity test succeeded');
-                        setVerificationCookieAndRedirect();
-                        return;
-                        
-                    } catch (httpsError) {
-                        clearTimeout(timeoutIdHttps);
-                        console.log('HTTPS fetch failed:', httpsError.message);
-                        throw httpsError;
-                    }
+                let connectivityTestUrl = testDomain;
+                if (!connectivityTestUrl.startsWith('http://') && !connectivityTestUrl.startsWith('https://')) {
+                    connectivityTestUrl = (window.location.protocol === 'https:' ? 'https://' : 'http://') + testDomain;
                 }
-                
-                if (!isHttpsPage) {
-                    const httpUrl = 'http://' + testDomain + '/';
-                    console.log('Testing HTTP URL:', httpUrl);
-                    
-                    const controllerHttp = new AbortController();
-                    const timeoutIdHttp = setTimeout(() => {
-                        controllerHttp.abort();
-                    }, 10000);
-                    
-                    try {
-                        const httpResponse = await fetch(httpUrl, {
-                            method: 'GET',
-                            mode: 'no-cors',
-                            cache: 'no-cache',
-                            credentials: 'omit',
-                            signal: controllerHttp.signal
-                        });
-                        
-                        clearTimeout(timeoutIdHttp);
-                        console.log('HTTP connectivity test succeeded');
-                        setVerificationCookieAndRedirect();
-                        return;
-                        
-                    } catch (httpError) {
-                        clearTimeout(timeoutIdHttp);
-                        throw httpError;
-                    }
-                }
-                
-            } catch (fetchError) {
-                console.log('Fetch tests failed, trying image loading:', fetchError.message);
-                
+                connectivityTestUrl += (connectivityTestUrl.includes('?') ? '&' : '?') + 'ts_main_check_v3=' + Date.now();
+
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 8000); 
+
                 try {
-                    await testImageLoad();
-                    console.log('Image test succeeded');
-                    setVerificationCookieAndRedirect();
-                    return;
-                } catch (imgError) {
-                    console.log('All connectivity tests failed');
-                    showError('All connectivity tests failed. Primary error: ' + fetchError.message + '. Image test: ' + imgError.message);
+                    await fetch(connectivityTestUrl, { method: 'GET', mode: 'no-cors', cache: 'no-cache', credentials: 'omit', signal: controller.signal });
+                    clearTimeout(timeoutId);
+                    verified = true;
+                } catch (fetchError) {
+                    clearTimeout(timeoutId);
+                    lastErrorMessage = 'Fetch failed: ' + fetchError.message;
+                    if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Fetch failed, trying image. Error:', fetchError.message);
+                    try {
+                         await new Promise((resolve, reject) => {
+                            const img = new Image();
+                            const imgTimeout = setTimeout(() => { img.onerror = null; img.onload = null; reject(new Error('TailscaleAuth: Image load timeout')); }, 5000);
+                            img.onload = () => { clearTimeout(imgTimeout); resolve(); };
+                            img.onerror = (errEvent) => { clearTimeout(imgTimeout); reject(new Error('TailscaleAuth: Image load failed - ' + (errEvent ? errEvent.type : 'unknown error'))); };
+                            
+                            let imgBaseUrl = testDomain;
+                            if (!imgBaseUrl.startsWith('http://') && !imgBaseUrl.startsWith('https://')) {
+                                imgBaseUrl = (window.location.protocol === 'https:' ? 'https://' : 'http://') + testDomain;
+                            }
+                            const urlObj = new URL(imgBaseUrl);
+                            img.src = urlObj.protocol + '//' + urlObj.host + '/favicon.ico?ts_main_img_v3=' + Date.now();
+                        });
+                        verified = true;
+                        lastErrorMessage = ''; 
+                    } catch (imgError) {
+                         lastErrorMessage += '. Image fallback failed: ' + imgError.message;
+                         if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Image fallback failed:', imgError.message);
+                    }
                 }
+            } catch (e) {
+                 lastErrorMessage = 'Unexpected error: ' + e.message;
+                 if (typeof console !== 'undefined' && console.error) console.error('TailscaleAuth: Error during main verification:', e);
+            }
+
+            if(verified) {
+                setVerificationCookieAndRedirect();
+            } else {
+                showError(lastErrorMessage);
             }
         }
 
         function setVerificationCookieAndRedirect() {
-            console.log('Setting verification cookie and redirecting...');
+            if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Setting verification cookie.');
             
-            const token = generateClientToken();
+            const newTimestamp = Date.now();
+            const clientSideTokenPart = Array(16).fill(0).map(() => Math.floor(Math.random() * 36).toString(36)).join('');
+            const cookieValueToSet = newTimestamp + "." + clientSideTokenPart;
+            
             const expiry = new Date();
-            expiry.setTime(expiry.getTime() + (24 * 60 * 60 * 1000)); // 24 hours
+            expiry.setTime(newTimestamp + sessionTimeoutMilliseconds);
             
-            document.cookie = 'tailscale_verified=' + token + '; expires=' + expiry.toUTCString() + '; path=/; secure; samesite=lax';
-            console.log('Verification cookie set:', token);
+            let cookieString = 'tailscale_verified=' + cookieValueToSet + 
+                               '; expires=' + expiry.toUTCString() + 
+                               '; path=/;' +
+                               '%s' + // cookieDomainDirective
+                               '%s' + // secureCookieFlagString
+                               ' samesite=lax';
+            document.cookie = cookieString;
+            if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Verification cookie set. Value:', cookieValueToSet.substring(0, cookieValueToSet.indexOf('.') + 4) + '...');
             
             showSuccess();
             setTimeout(() => {
-                console.log('Redirecting to:', originalURL);
+                if (typeof console !== 'undefined' && console.log) console.log('TailscaleAuth: Redirecting to original URL:', originalURL);
                 window.location.href = originalURL;
             }, 3000);
         }
 
-        function generateClientToken() {
-            const timestamp = Date.now();
-            const random = Math.random().toString(36).substring(2);
-            const domain = testDomain.replace(/[^a-zA-Z0-9]/g, '');
-            
-            const tokenData = timestamp + '-' + random + '-' + domain;
-            let hash = 0;
-            for (let i = 0; i < tokenData.length; i++) {
-                const char = tokenData.charCodeAt(i);
-                hash = ((hash << 5) - hash) + char;
-                hash = hash & hash;
-            }
-            
-            return Math.abs(hash).toString(16) + random;
-        }
-
-        function testImageLoad() {
-            return new Promise((resolve, reject) => {
-                console.log('Starting image load test...');
-                
-                const isHttpsPage = window.location.protocol === 'https:';
-                
-                if (isHttpsPage) {
-                    const img = new Image();
-                    const timeout = setTimeout(() => {
-                        img.onerror = null;
-                        img.onload = null;
-                        reject(new Error('HTTPS image load timeout'));
-                    }, 8000);
-                    
-                    img.onload = () => {
-                        clearTimeout(timeout);
-                        console.log('Image loaded successfully via HTTPS');
-                        resolve();
-                    };
-                    
-                    img.onerror = (error) => {
-                        clearTimeout(timeout);
-                        console.log('HTTPS image load failed:', error);
-                        reject(new Error('HTTPS image load failed'));
-                    };
-                    
-                    img.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
-                    
-                } else {
-                    const img = new Image();
-                    const timeout = setTimeout(() => {
-                        img.onerror = null;
-                        img.onload = null;
-                        reject(new Error('Image load timeout'));
-                    }, 6000);
-                    
-                    img.onload = () => {
-                        clearTimeout(timeout);
-                        console.log('Image loaded successfully via HTTP');
-                        resolve();
-                    };
-                    
-                    img.onerror = () => {
-                        clearTimeout(timeout);
-                        
-                        const img2 = new Image();
-                        const timeout2 = setTimeout(() => {
-                            img2.onerror = null;
-                            img2.onload = null;
-                            reject(new Error('Image load failed (both HTTP and HTTPS)'));
-                        }, 4000);
-                        
-                        img2.onload = () => {
-                            clearTimeout(timeout2);
-                            console.log('Image loaded successfully via HTTPS');
-                            resolve();
-                        };
-                        
-                        img2.onerror = () => {
-                            clearTimeout(timeout2);
-                            reject(new Error('Image load failed (both HTTP and HTTPS)'));
-                        };
-                        
-                        img2.src = 'https://' + testDomain + '/favicon.ico?t=' + Date.now();
-                    };
-                    
-                    img.src = 'http://' + testDomain + '/favicon.ico?t=' + Date.now();
-                }
-            });
-        }
-
         function showSuccess() {
-            document.getElementById('checking').classList.remove('active');
-            document.getElementById('checking').classList.add('hidden');
-            document.getElementById('success').classList.remove('hidden');
-            document.getElementById('success').classList.add('active');
-            document.getElementById('success-details').classList.remove('hidden');
+            const checkingDiv = document.getElementById('checking');
+            const successDiv = document.getElementById('success');
+            const successDetailsDiv = document.getElementById('success-details');
+            if(checkingDiv) { checkingDiv.classList.remove('active'); checkingDiv.classList.add('hidden'); }
+            if(successDiv) { successDiv.classList.remove('hidden'); successDiv.classList.add('active'); }
+            if(successDetailsDiv) successDetailsDiv.classList.remove('hidden');
             
             let countdown = 3;
             const countdownElement = document.getElementById('countdown');
+            if(countdownElement) countdownElement.textContent = countdown;
             const countdownTimer = setInterval(() => {
                 countdown--;
-                countdownElement.textContent = countdown;
-                if (countdown <= 0) {
-                    clearInterval(countdownTimer);
-                }
+                if(countdownElement) countdownElement.textContent = countdown;
+                if (countdown <= 0) clearInterval(countdownTimer);
             }, 1000);
         }
 
         function showError(message) {
-            document.getElementById('checking').classList.remove('active');
-            document.getElementById('checking').classList.add('hidden');
-            document.getElementById('error').classList.remove('hidden');
-            document.getElementById('error').classList.add('active');
-            document.getElementById('error-details').classList.remove('hidden');
-            document.getElementById('error-message').textContent = message;
+            const checkingDiv = document.getElementById('checking');
+            const errorDiv = document.getElementById('error');
+            const errorDetailsDiv = document.getElementById('error-details');
+            const errorMsgElem = document.getElementById('error-message');
+
+            if(checkingDiv) { checkingDiv.classList.remove('active'); checkingDiv.classList.add('hidden'); }
+            if(errorDiv) { errorDiv.classList.remove('hidden'); errorDiv.classList.add('active'); }
+            if(errorDetailsDiv) errorDetailsDiv.classList.remove('hidden');
+            if(errorMsgElem) errorMsgElem.textContent = message;
         }
 
         function retryVerification() {
             if (verificationAttempts >= maxAttempts) {
-                alert('Maximum verification attempts reached. Please check your Tailscale connection and refresh the page.');
+                alert('Maximum verification attempts reached. Please check your Tailscale connection and refresh the page manually.');
                 return;
             }
+            const errorDiv = document.getElementById('error');
+            const errorDetailsDiv = document.getElementById('error-details');
+            const successDiv = document.getElementById('success');
+            const successDetailsDiv = document.getElementById('success-details');
+
+            if(errorDiv) errorDiv.classList.add('hidden');
+            if(errorDetailsDiv) errorDetailsDiv.classList.add('hidden');
+            if(successDiv) successDiv.classList.add('hidden');
+            if(successDetailsDiv) successDetailsDiv.classList.add('hidden');
             
-            document.getElementById('error').classList.add('hidden');
-            document.getElementById('error').classList.remove('active');
-            document.getElementById('error-details').classList.add('hidden');
-            document.getElementById('checking').classList.remove('hidden');
-            document.getElementById('checking').classList.add('active');
-            
-            setTimeout(verifyTailscaleConnectivity, 1000);
+            setTimeout(verifyTailscaleConnectivity, 200);
         }
 
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log('Page loaded, starting verification in 1 second...');
-            setTimeout(verifyTailscaleConnectivity, 1000);
-        });
+        if (document.readyState === 'loading') {
+             document.addEventListener('DOMContentLoaded', () => setTimeout(verifyTailscaleConnectivity, 200));
+        } else {
+            setTimeout(verifyTailscaleConnectivity, 200);
+        }
     </script>
 </body>
-</html>`, 
+</html>`,
 		customCSS,
 		t.config.TestDomain,
 		t.config.TestDomain,
 		t.config.SuccessMessage,
 		t.config.TestDomain,
 		originalURL,
+		sessionTimeoutMilliseconds,
 		customScript,
+		cookieDomainDirective,
+		secureCookieFlagString,
 	)
 }
 
@@ -516,12 +602,21 @@ func (t *TailscaleConnectivityAuth) getDefaultCSS() string {
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(120deg, #5E72E4 0%, #825EE4 50%, #4158D0 100%);
+            background-size: 250% 250%;
+            animation: gradientBG 12s ease infinite;
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             padding: 20px;
+            overflow: hidden;
+        }
+
+        @keyframes gradientBG {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
         }
 
         .container {
@@ -532,248 +627,133 @@ func (t *TailscaleConnectivityAuth) getDefaultCSS() string {
         .verification-card {
             background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.2), 0 0 15px rgba(0,0,0,0.05);
             padding: 40px;
             text-align: center;
-            animation: slideUp 0.6s ease-out;
+            animation: slideUp 0.7s cubic-bezier(0.25, 0.8, 0.25, 1);
+            position: relative;
+            z-index: 1;
         }
 
         @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(40px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
-        .header h1 {
-            color: #333;
-            margin: 20px 0 10px;
-            font-size: 28px;
-            font-weight: 600;
+        .header h1 { color: #333; margin: 20px 0 10px; font-size: 28px; font-weight: 600; }
+        .header p { color: #666; font-size: 16px; margin-bottom: 30px; }
+
+        .tailscale-logo { display: inline-block; margin-bottom: 10px; animation: pulseLogo 2.5s infinite ease-in-out; }
+        @keyframes pulseLogo {
+            0%, 100% { transform: scale(1); opacity: 0.85; }
+            50% { transform: scale(1.04); opacity: 1; }
         }
 
-        .header p {
-            color: #666;
-            font-size: 16px;
-            margin-bottom: 30px;
-        }
-
-        .tailscale-logo {
-            display: inline-block;
-            margin-bottom: 10px;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.05); }
-        }
-
-        .status-container {
-            margin: 30px 0;
-        }
-
+        .status-container { margin: 30px 0; }
         .status-item {
             display: flex;
             align-items: center;
             justify-content: center;
-            padding: 20px;
+            padding: 18px 20px;
             border-radius: 12px;
             margin: 15px 0;
             font-size: 16px;
             font-weight: 500;
-            transition: all 0.3s ease;
+            transition: all 0.35s cubic-bezier(0.25, 0.8, 0.25, 1);
+            border-width: 1px;
+            border-style: solid;
         }
 
         .status-item.active {
-            background: #f0f9ff;
-            border: 2px solid #3b82f6;
-            color: #1e40af;
+            background: #edf2ff;
+            border-color: #788ff7;
+            color: #3a50a3;
+            transform: scale(1.03);
+            box-shadow: 0 5px 20px rgba(94, 114, 228, 0.25);
         }
-
         .status-item.success {
-            background: #ecfdf5;
-            border: 2px solid #10b981;
-            color: #047857;
+            background: #e6f9f0;
+            border-color: #50d38a;
+            color: #00702d;
+            transform: scale(1.03);
+            box-shadow: 0 5px 20px rgba(0, 200, 81, 0.2);
         }
-
         .status-item.error {
-            background: #fef2f2;
-            border: 2px solid #ef4444;
-            color: #dc2626;
+            background: #fff0f0;
+            border-color: #ff7777;
+            color: #c00000;
+            transform: scale(1.03);
+            box-shadow: 0 5px 20px rgba(255, 68, 68, 0.2);
         }
-
-        .hidden {
-            display: none !important;
-        }
+        .hidden { display: none !important; }
 
         .spinner {
-            width: 20px;
-            height: 20px;
-            border: 2px solid #3b82f6;
-            border-top: 2px solid transparent;
+            width: 22px;
+            height: 22px;
             border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-right: 12px;
+            position: relative;
+            animation: spinnerRotate 0.9s linear infinite;
+            margin-right: 15px;
+            border: none;
         }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+        .spinner::before {
+            content: "";
+            position: absolute;
+            border-radius: 50%;
+            inset: 0;
+            border: 3px solid #a1bfff;
+            border-top-color: #5E72E4;
         }
+        @keyframes spinnerRotate { to { transform: rotate(360deg); } }
 
         .check-icon, .error-icon {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-right: 12px;
-            font-weight: bold;
-            font-size: 16px;
+            width: 24px; height: 24px; border-radius: 50%; display: flex;
+            align-items: center; justify-content: center; margin-right: 12px;
+            font-weight: bold; font-size: 16px; color: white;
         }
+        .check-icon { background: #00C851; }
+        .error-icon { background: #FF4444; }
 
-        .check-icon {
-            background: #10b981;
-            color: white;
-        }
-
-        .error-icon {
-            background: #ef4444;
-            color: white;
-        }
-
-        .error-details, .success-details {
-            text-align: left;
-            background: #f9fafb;
-            border-radius: 12px;
-            padding: 25px;
-            margin-top: 20px;
-        }
-
-        .error-details h3 {
-            color: #374151;
-            margin-bottom: 15px;
-            font-size: 18px;
-        }
-
-        .error-details ol {
-            margin: 15px 0;
-            padding-left: 20px;
-        }
-
-        .error-details li {
-            margin: 8px 0;
-            color: #4b5563;
-            line-height: 1.5;
-        }
-
-        .technical-details {
-            margin-top: 20px;
-            border-top: 1px solid #e5e7eb;
-            padding-top: 20px;
-        }
-
+        .error-details, .success-details { text-align: left; background: #f8f9fa; border-radius: 12px; padding: 25px; margin-top: 20px; }
+        .error-details h3 { color: #374151; margin-bottom: 15px; font-size: 18px; }
+        .error-details ol { margin: 15px 0; padding-left: 20px; }
+        .error-details li { margin: 8px 0; color: #4b5563; line-height: 1.5; }
+        .technical-details { margin-top: 20px; border-top: 1px solid #e5e7eb; padding-top: 20px; }
         .technical-details summary {
-            cursor: pointer;
-            font-weight: 500;
-            color: #374151;
-            padding: 5px 0;
+            cursor: pointer; font-weight: 500; color: #55595e;
+            padding: 10px 5px; border-radius: 6px; transition: background-color 0.2s, color 0.2s;
         }
+        .technical-details summary:hover, .technical-details summary:focus { color: #000; background-color: #e9ecef; }
+        .technical-details p { margin: 10px 0; color: #6b7280; font-size: 14px; line-height: 1.5; }
 
-        .technical-details p {
-            margin: 10px 0;
-            color: #6b7280;
-            font-size: 14px;
-            line-height: 1.5;
-        }
-
-        code {
-            background: #f3f4f6;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'SF Mono', Monaco, monospace;
-            font-size: 13px;
-            color: #374151;
-        }
+        code { background: #e9ecef; padding: 3px 7px; border-radius: 4px; font-family: 'SF Mono', Monaco, monospace; font-size: 13px; color: #cb0000; }
 
         .retry-button {
-            background: #3b82f6;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 500;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin: 20px auto 0;
-            transition: background 0.2s;
+            background: #5E72E4; color: white; border: none; padding: 12px 28px;
+            border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer;
+            display: inline-flex; align-items: center; justify-content: center;
+            margin: 25px auto 0;
+            transition: background-color 0.2s, transform 0.15s ease-out, box-shadow 0.2s ease-out;
+            box-shadow: 0 3px 6px rgba(0,0,0,0.1);
+            text-transform: uppercase; letter-spacing: 0.5px;
         }
+        .retry-button:hover { background: #4e63d4; box-shadow: 0 6px 12px rgba(94, 114, 228, 0.3); transform: translateY(-2px); }
+        .retry-button:active { transform: translateY(0px) scale(0.98); box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .retry-icon { margin-right: 10px; font-size: 16px; }
 
-        .retry-button:hover {
-            background: #2563eb;
-        }
+        .progress-bar { width: 100%; height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin: 20px 0; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #00C851, #00E676); animation: progress 3s linear; border-radius: 4px; }
+        @keyframes progress { from { width: 0%; } to { width: 100%; } }
 
-        .retry-icon {
-            margin-right: 8px;
-            font-size: 16px;
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 6px;
-            background: #e5e7eb;
-            border-radius: 3px;
-            overflow: hidden;
-            margin: 20px 0;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #10b981, #34d399);
-            animation: progress 3s linear;
-        }
-
-        @keyframes progress {
-            from { width: 0%; }
-            to { width: 100%; }
-        }
-
-        .redirect-text {
-            color: #6b7280;
-            font-size: 14px;
-            margin-top: 10px;
-        }
-
-        a {
-            color: #3b82f6;
-            text-decoration: none;
-        }
-
-        a:hover {
-            text-decoration: underline;
-        }
+        .redirect-text { color: #6b7280; font-size: 14px; margin-top: 10px; }
+        a { color: #5E72E4; text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; color: #4e63d4; }
 
         @media (max-width: 480px) {
-            .verification-card {
-                padding: 30px 20px;
-            }
-            
-            .header h1 {
-                font-size: 24px;
-            }
-            
-            .status-item {
-                padding: 15px;
-                font-size: 14px;
-            }
+            .verification-card { padding: 30px 20px; }
+            .header h1 { font-size: 24px; }
+            .status-item { padding: 15px; font-size: 14px; }
+            .retry-button { padding: 10px 20px; font-size: 14px; }
         }
     `
 }

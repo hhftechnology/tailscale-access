@@ -1,9 +1,10 @@
 displayName: Tailscale Connectivity Authentication
 type: middleware
+iconPath: .assets/icon.png
 
 import: github.com/hhftechnology/tailscale-access
 
-summary: Smart Tailscale authentication using real connectivity testing instead of unreliable IP checking
+summary: Smart Tailscale authentication using real connectivity testing
 
 testData:
   testDomain: example.ts.net
