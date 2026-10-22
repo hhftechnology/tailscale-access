@@ -1,4 +1,6 @@
 # 
+
+[![Discuss on the HHF forum](https://img.shields.io/badge/discuss-forum.hhf.technology-AD1457?logo=discourse&logoColor=white)](https://forum.hhf.technology/c/traefik-plugins-tools/tailscale-access)
 <div align="center" width="100%">
     <h1> Tailscale Connectivity Authentication Plugin for Traefik v3</h1>
     <img width="auto" src=".assets/banner.png">
